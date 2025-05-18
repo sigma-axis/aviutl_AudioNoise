@@ -1,0 +1,25 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.13.35931.197 d17.13
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "AudioNoise", "AudioNoise.vcxproj", "{54F26839-444A-49A5-9765-7AEE751479E2}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|x86 = Debug|x86
+		Release|x86 = Release|x86
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{54F26839-444A-49A5-9765-7AEE751479E2}.Debug|x86.ActiveCfg = Debug|Win32
+		{54F26839-444A-49A5-9765-7AEE751479E2}.Debug|x86.Build.0 = Debug|Win32
+		{54F26839-444A-49A5-9765-7AEE751479E2}.Release|x86.ActiveCfg = Release|Win32
+		{54F26839-444A-49A5-9765-7AEE751479E2}.Release|x86.Build.0 = Release|Win32
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {7E62BA30-6DD0-47AF-A722-9C1A40A2D04F}
+	EndGlobalSection
+EndGlobal
