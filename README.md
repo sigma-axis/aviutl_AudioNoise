@@ -2,7 +2,7 @@
 
 AviUtl の拡張編集に「音声ノイズ」「音声ノイズ乗算」「パルスノイズ」のフィルタ効果・フィルタオブジェクトを追加するプラグインです．[ホワイトノイズ](https://ja.wikipedia.org/wiki/ホワイトノイズ)や[ブラウンノイズ](https://ja.wikipedia.org/wiki/ブラウニアンノイズ)などを再生したり，他の音声にノイズを混ぜたような効果を乗せたりできます．
 
-[ダウンロードはこちら．](https://github.com/sigma-axis/aviutl_AudioNoise/releases)
+[ダウンロードはこちら．](https://github.com/sigma-axis/aviutl_AudioNoise/releases) [紹介動画．](https://www.nicovideo.jp/watch/sm44997398)
 
 ![風が吹き荒れてるっぽいノイズ波形](https://github.com/user-attachments/assets/fbdba93f-4331-451a-b99d-adf6397b342c)
 
