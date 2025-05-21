@@ -92,7 +92,7 @@ struct check_data {
 	};
 };
 
-#define PLUGIN_VERSION	"v1.00"
+#define PLUGIN_VERSION	"v1.01-test1"
 #define PLUGIN_AUTHOR	"sigma-axis"
 #define FILTER_INFO_FMT(name, ver, author)	(name " " ver " by " author)
 #define FILTER_INFO(name)	constexpr char filter_name[] = name, info[] = FILTER_INFO_FMT(name, PLUGIN_VERSION, PLUGIN_AUTHOR)
@@ -319,6 +319,94 @@ namespace noise_multiply
 		filter = make_filter({});
 }
 
+namespace velvet
+{
+	FILTER_INFO("Velvet Noise");
+
+	// trackbars.
+	constexpr char const* track_names[] = { "平均周期", "指数", "背景音量" };
+	constexpr int32_t
+		track_denom[]	= {    1,    100,   10 },
+		track_min[]		= {    1, -40000,    0 },
+		track_min_drag[]= {    4, -20000,    0 },
+		track_default[]	= {   16,      0, 1000 },
+		track_max_drag[]= {   64, +20000, 1000 },
+		track_max[]		= { 1000, +40000, 2000 };
+
+	static_assert(
+		std::size(track_names) == std::size(track_denom) &&
+		std::size(track_names) == std::size(track_min) &&
+		std::size(track_names) == std::size(track_min_drag) &&
+		std::size(track_names) == std::size(track_default) &&
+		std::size(track_names) == std::size(track_max_drag) &&
+		std::size(track_names) == std::size(track_max));
+
+	namespace idx_track
+	{
+		enum id : int {
+			period,
+			alpha,
+			back_volume,
+		};
+	};
+
+	// checks.
+	constexpr char const* check_names[] = {
+		"ステレオ",
+		"設定...",
+	};
+	constexpr int32_t check_default[] = {
+		check_data::unchecked,
+		check_data::button,
+	};
+
+	static_assert(std::size(check_names) == std::size(check_default));
+
+	namespace idx_check
+	{
+		enum id : int {
+			stereo,
+			detail,
+		};
+	};
+
+	// exdata.
+	using noise::Exdata, noise::exdata_def, noise::exdata_use;
+	namespace idx_exdata = noise::idx_exdata;
+
+	// callbacks.
+	BOOL func_proc(ExEdit::Filter* efp, ExEdit::FilterProcInfo* efpip);
+	using noise::func_WndProc, noise::func_window_init;
+
+	// spec.
+	inline constinit ExEdit::Filter filter = {
+		.flag				= ExEdit::Filter::Flag::Audio | ExEdit::Filter::Flag::Input,
+		.name				= const_cast<char*>(filter_name),
+		.track_n			= std::size(track_names),
+		.track_name			= const_cast<char**>(track_names),
+		.track_default		= const_cast<int*>(track_default),
+		.track_s			= const_cast<int*>(track_min),
+		.track_e			= const_cast<int*>(track_max),
+		.check_n			= std::size(check_names),
+		.check_name			= const_cast<char**>(check_names),
+		.check_default		= const_cast<int*>(check_default),
+		.func_proc			= &func_proc,
+		.func_init			= [](ExEdit::Filter* efp) { exedit.init(efp->exedit_fp); return TRUE; },
+		.func_WndProc		= &func_WndProc<idx_check::id>,
+		.exdata_size		= sizeof(Exdata),
+		.information		= const_cast<char*>(info),
+		.func_window_init	= &func_window_init<idx_check::id>,
+		.exdata_def			= const_cast<Exdata*>(&exdata_def),
+		.exdata_use			= exdata_use,
+		.track_scale		= const_cast<int*>(track_denom),
+		.track_drag_min		= const_cast<int*>(track_min_drag),
+		.track_drag_max		= const_cast<int*>(track_max_drag),
+	};
+
+	// constants.
+	using noise::std_height, noise::to_int;
+}
+
 namespace pulse
 {
 	FILTER_INFO("パルスノイズ");
@@ -513,13 +601,37 @@ private:
 struct colored_noise {
 	constexpr static size_t max_fft_size = noise::Exdata::max_fft_size;
 
-private:
+protected:
 	// maximum size is doubled to make use of the cached sin/cos table.
 	using FFT = sigma_lib::fft::FFT<2 * max_fft_size, float>;
 	static inline std::unique_ptr<FFT> fft{};
+	static void init_fft() { if (!fft) fft = std::make_unique<FFT>(); }
+
+	static FFT::cpx* fft_buf() { return reinterpret_cast<FFT::cpx*>(memory_ptr); }
+	static float* wt_tbl(uint32_t fft_size) { return reinterpret_cast<float*>(fft_buf() + 2 * fft_size); }
+
+	static void prepare_weight_table(uint32_t fft_size, float alpha, float scale)
+	{
+		auto const wt = wt_tbl(fft_size);
+
+		// pre-calculate the bias of the colored noise.
+		float power = 0;
+		for (size_t i = 0; i < fft_size / 2; i++) {
+			auto const r = std::pow(0.5f + i, -alpha / 2);
+			wt[i] = r;
+			power += r * r;
+		}
+
+		// normalize the power.
+		power = scale / std::sqrt(power);
+		for (size_t i = 0; i < fft_size / 2; i++) wt[i] *= power;
+	}
 
 public:
-	colored_noise(float alpha, uint32_t fft_size, uint32_t seed, uint_fast64_t pos, size_t alt = 0)
+	static inline void* memory_ptr = nullptr;
+};
+struct powered_noise : colored_noise {
+	powered_noise(float alpha, uint32_t fft_size, uint32_t seed, uint_fast64_t pos, size_t alt = 0)
 		: alpha{ alpha }
 		, fft_size{ alpha == 0 ? 2 /* to let `get_index()` always return 0 */ : fft_size }
 		, buf{ alpha == 0 ?
@@ -536,10 +648,10 @@ public:
 		}
 		else {
 			// colored noise other than white. prepare for FFT.
-			if (!fft) fft = std::make_unique<FFT>();
+			init_fft();
 
 			// pre-calculate the weight table.
-			if (alt == 0) prepare_weight_table();
+			if (alt == 0) prepare_weight_table(fft_size, alpha, 0.5f);
 
 			// expand values to buf; needs two passes.
 			std::memset(buf + (fft_size / 2), 0, (fft_size / 2) * sizeof(float));
@@ -585,7 +697,7 @@ private:
 	{
 		// assumes alpha is nonzero.
 		// set random values to the frequency space.
-		auto const* const wt = wt_tbl();
+		auto const* const wt = wt_tbl(fft_size);
 		auto const buf1 = fft_buf(), buf2 = buf1 + fft_size;
 		for (size_t i = 0; i < fft_size / 2; i++) {
 			buf1[i] = { wt[i] * rng(), wt[i] * rng() };
@@ -665,30 +777,156 @@ private:
 		}
 	}
 #endif
+};
 
-	void prepare_weight_table() const
+struct velvet_noise : colored_noise {
+	velvet_noise(uint32_t period, float alpha, uint32_t fft_size, uint32_t seed,
+		uint_fast64_t pos, uint_fast64_t count_period, double phase_period, size_t alt = 0)
+		: period{ period }, fft_size{ fft_size }, alpha{ alpha }
+		, pos{ pos }, count_period{ count_period }
+		, pos_period{ static_cast<uint32_t>(std::clamp<int>(std::lround(phase_period * period), 0, period - 1)) }
+		, rng{ seed ^ philox::default_seed }
+		, buf{ alpha == 0 ? nullptr :
+			(wt_tbl(fft_size) + (fft_size / 2)) + fft_size * alt }
+		, red_bits{ std::bit_width(max_fft_size) - std::bit_width(fft_size) }
 	{
-		auto const wt = wt_tbl();
-
-		// pre-calculate the bias of the colored noise.
-		float power = 0;
-		for (size_t i = 0; i < fft_size / 2; i++) {
-			auto const r = std::pow(0.5f + i, -alpha / 2);
-			wt[i] = r;
-			power += r * r;
+		if (alpha == 0) {
+			rng.discard(max_fft_size + count_period);
+			set_next();
 		}
+		else {
+			// colored noise other than white. prepare for FFT.
+			init_fft();
 
-		// normalize the power.
-		power = 0.5f / std::sqrt(power);
-		for (size_t i = 0; i < fft_size / 2; i++) wt[i] *= power;
+			// pre-calculate the weight table.
+			if (alt == 0) prepare_weight_table(fft_size, alpha,
+				1 / std::sqrtf(static_cast<float>(2 * fft_size)));
+
+			// prepare output buffer. adjust positions.
+			uint_fast64_t rng_pos = max_fft_size + count_period;
+			uint32_t pos_period_0 = pos_period;
+			auto const pos_residue = pos & (fft_size / 2 - 1);
+			if (pos_residue + fft_size / 2 > pos_period) {
+				auto const l = pos_residue + fft_size / 2 - pos_period + period - 1;
+				rng_pos -= l / period;
+				pos_period_0 = (period - 1) - (l % period);
+			}
+
+			// expand values to buf; needs two passes.
+			rng.discard(rng_pos);
+			batch(pos_period_0);
+			batch((pos_period_0 + fft_size / 2) % period);
+		}
 	}
 
-	static FFT::cpx* fft_buf() { return reinterpret_cast<FFT::cpx*>(memory_ptr); }
-	static float* wt_tbl(size_t fft_size) { return reinterpret_cast<float*>(fft_buf() + 2 * fft_size); }
-	float* wt_tbl() const { return wt_tbl(fft_size); }
+	uint32_t const period, fft_size;
+	float const alpha;
+	uint_fast64_t pos, count_period;
 
-public:
-	static inline void* memory_ptr = nullptr;
+	float value() const {
+		if (alpha == 0)
+			return pos_period == pos_pulse ? neg_pulse ? -1.0f : 1.0f : 0.0f;
+		else return buf[pos & (fft_size / 2 - 1)];
+	}
+	void move_next() {
+		pos++; pos_period++;
+		if (pos_period == period) {
+			pos_period = 0;
+			count_period++;
+		}
+
+		if (alpha == 0) {
+			if (pos_period == 0) set_next();
+		}
+		else {
+			if ((pos & (fft_size / 2 - 1)) == 0) batch(pos_period);
+		}
+	}
+	double phase_period() const { return pos_period / static_cast<double>(period); }
+
+private:
+	int const red_bits; // number of bits reduced from the maximum.
+
+	using philox = sigma_lib::rng::philox_test::philox4x32;
+	uint32_t pos_period;
+	philox rng;
+	uint32_t pos_pulse;
+	bool neg_pulse;
+	float* const buf;
+
+	std::pair<uint32_t, bool> parse_rand(uint32_t r) const {
+		return {
+			static_cast<uint32_t>((period * static_cast<uint64_t>(r & ~(1u << 31))) >> 31),
+			(r & (1u << 31)) != 0
+		};
+	}
+
+	void set_next() { std::tie(pos_pulse, neg_pulse) = parse_rand(rng()); }
+	void batch(uint_fast64_t pos_period_0)
+	{
+		// assumes alpha is nonzero.
+		auto rng1 = rng;
+
+		// estimate the previous batch state.
+		uint32_t pos_period_1;
+		if (pos_period_0 >= fft_size / 2) pos_period_1 = (pos_period_0 - fft_size / 2) % period;
+		else {
+			auto const l = fft_size / 2 - pos_period_0 + period - 1;
+			rng.discard(l / period);
+			pos_period_1 = (period - 1) - (l % period);
+		}
+
+		// set velvet noise to the time space.
+		auto const buf1 = fft_buf(), buf2 = buf1 + fft_size;
+		std::memset(buf1, 0, sizeof(FFT::cpx) * fft_size);
+		auto [pos_pulse_1, neg_pulse_1] = parse_rand(rng1());
+		for (size_t i = 0; i < fft_size; i++) {
+			if (pos_pulse_1 == pos_period_1) {
+				// - tilt by `-pi i n/N` so the frequency is shifted by 0.5.
+				// - taking the complex conjugate to adapt to inverse FFT.
+				auto& q = fft->q(i << red_bits);
+				buf1[i] = neg_pulse_1 ? -q : q;
+			}
+
+			// determine the next position of the pulse.
+			if (++pos_period_1 == period) {
+				pos_period_1 = 0;
+				std::tie(pos_pulse_1, neg_pulse_1) = parse_rand(rng1());
+			}
+		}
+
+		// perform FFT.
+		auto ptr = fft->inv(buf1, buf2, fft_size);
+
+		// modify values in the frequency space.
+		auto const* const wt = wt_tbl(fft_size);
+		for (size_t i = 0; i < fft_size / 2; i++) {
+			// bias of the colored noise.
+			auto const v = wt[i] * ptr[i];
+
+			// taking the complex conjugate to adapt the former inverse FFT.
+			buf1[i] = std::conj(v);
+			buf1[fft_size - 1 - i] = v;
+		}
+
+		// perform inverse FFT.
+		ptr = fft->inv(buf1, buf2, fft_size);
+
+		// place the values to the destination buffer.
+		for (size_t i = 0; i < fft_size / 2; i++) {
+			auto const j = i + fft_size / 2;
+			// - tilt back by `pi i n/N`.
+			// - only the real part is in interest.
+			// - glue with the half of the previous section by Hann function.
+			auto const& q = fft->q(i << red_bits);
+			auto const hann = q.imag() * q.imag();
+			buf[i] = hann * (
+				q.real() * ptr[i].real() - q.imag() * ptr[i].imag())
+				+ buf[j];
+			buf[j] = (1 - hann) * (
+				-q.imag() * ptr[j].real() - q.real() * ptr[j].imag());
+		}
+	}
 };
 
 
@@ -734,13 +972,10 @@ static inline std::pair<double, pos_phase*> adjust_pos_phase(double hertz, ExEdi
 	pos_phase_cache* const cache = reinterpret_cast<pos_phase_cache*>(exedit.get_or_create_cache(
 		efp->processing, sizeof(pos_phase_cache) / alignof(pos_phase_cache), 1, 8 * alignof(pos_phase_cache),
 		0, &cache_exists_flag));
-	if (cache_exists_flag != 0 && cache != nullptr) {
-		pos = cache->curr.pos;
-		phase = cache->curr.phase;
-	}
 
 	// ref: https://github.com/nazonoSAUNA/simple_wave.eef/blob/main/src.cpp
 	auto curr_milliframe = 1000 * (efpip->frame + efpip->add_frame);
+	bool is_head = false;
 	if (efpip->audio_speed != 0) {
 		curr_milliframe = efpip->audio_milliframe - 1000 * (efpip->frame_num - efpip->frame);
 		auto const
@@ -748,14 +983,20 @@ static inline std::pair<double, pos_phase*> adjust_pos_phase(double hertz, ExEdi
 			frame = 0.001 * curr_milliframe;
 
 		delta_phase *= std::abs(speed);
-		if (speed >= 0 ? frame - speed < 0 : frame - speed >= efpip->frame_n) { // 想定の前回描画フレームが範囲外．
-			pos = 0;
-			phase = 0;
-		}
+		if (speed >= 0 ? frame - speed < 0 : frame - speed >= efpip->frame_n) // 想定の前回描画フレームが範囲外．
+			is_head = true;
 	}
-	else if (curr_milliframe == 0) { // 1フレーム目
+	else if (curr_milliframe == 0) is_head = true; // 1フレーム目
+	if (is_head || cache_exists_flag == 0 || cache == nullptr ||
+		(efpip->audio_speed >= 0 ?
+			curr_milliframe < cache->prev_milliframe :
+			curr_milliframe > cache->prev_milliframe)) {
 		pos = 0;
 		phase = 0;
+	}
+	else {
+		pos = cache->curr.pos;
+		phase = cache->curr.phase;
 	}
 
 	if (cache != nullptr) {
@@ -841,12 +1082,12 @@ BOOL noise::func_proc(ExEdit::Filter* efp, ExEdit::FilterProcInfo* efpip)
 
 	// generate noise.
 	auto step_one = lambda_step_one(phase, raw_freq >= max_freq ? 1.0 : delta_phase);
-	auto val = [&phase_ref](colored_noise const& gen) { return to_int(gen.value(static_cast<float>(phase_ref))); };
+	auto val = [&phase_ref](powered_noise const& gen) { return to_int(gen.value(static_cast<float>(phase_ref))); };
 	set_noise_gen_space(efpip);
 	int16_t* const data = efpip->audio_data;
 	if (stereo && efpip->audio_ch == 2) {
 		// prepare two noise generators.
-		colored_noise
+		powered_noise
 			genL{ alpha, fft_size, seed, pos },
 			genR{ alpha, fft_size, ~seed, pos, 1 };
 
@@ -862,7 +1103,7 @@ BOOL noise::func_proc(ExEdit::Filter* efp, ExEdit::FilterProcInfo* efpip)
 	}
 	else {
 		// prepare a noise generator.
-		colored_noise gen{ alpha, fft_size, seed, pos };
+		powered_noise gen{ alpha, fft_size, seed, pos };
 
 		// write values to the buffer.
 		if (efpip->audio_ch == 2) {
@@ -947,7 +1188,7 @@ BOOL noise_multiply::func_proc(ExEdit::Filter* efp, ExEdit::FilterProcInfo* efpi
 
 	// filter by noise.
 	auto step_one = lambda_step_one(phase, raw_freq >= max_freq ? 1.0 : delta_phase);
-	auto val = [&phase_ref](colored_noise const& gen) { return gen.value(static_cast<float>(phase_ref)); };
+	auto val = [&phase_ref](powered_noise const& gen) { return gen.value(static_cast<float>(phase_ref)); };
 	auto bound = [=, dyn_range = std::max(u_bound - l_bound, 0.0f)](float noise) {
 		auto const ret = dyn_range <= 0 ?
 			std::abs(noise) <= l_bound ? 0.0f : 1.0f :
@@ -963,7 +1204,7 @@ BOOL noise_multiply::func_proc(ExEdit::Filter* efp, ExEdit::FilterProcInfo* efpi
 		efpip->audio_data : efpip->audio_p;
 	if (stereo && efpip->audio_ch == 2) {
 		// prepare two noise generators.
-		colored_noise
+		powered_noise
 			genL{ alpha, fft_size, seed, pos },
 			genR{ alpha, fft_size, ~seed, pos, 1 };
 
@@ -979,7 +1220,7 @@ BOOL noise_multiply::func_proc(ExEdit::Filter* efp, ExEdit::FilterProcInfo* efpi
 	}
 	else {
 		// prepare a noise generator.
-		colored_noise gen{ alpha, fft_size, seed, pos };
+		powered_noise gen{ alpha, fft_size, seed, pos };
 
 		// write values to the buffer.
 		if (efpip->audio_ch == 2) {
@@ -1001,6 +1242,178 @@ BOOL noise_multiply::func_proc(ExEdit::Filter* efp, ExEdit::FilterProcInfo* efpi
 
 	// store the phase and the position for the next use.
 	if (pos_phase_ptr != nullptr) *pos_phase_ptr = { pos, phase };
+
+	return TRUE;
+}
+
+struct pos_phase_velvet {
+	uint64_t pos;
+	double phase;
+	uint64_t count_period;
+	double phase_period;
+};
+// adjusts the frequency according to the playback rate,
+// and possibly reset the position and phase.
+static inline std::pair<double, pos_phase_velvet*> adjust_pos_phase_velvet(ExEdit::Filter const* efp, ExEdit::FilterProcInfo const* efpip)
+{
+	uint64_t pos = 0, count_period = 0;
+	double phase = 0, phase_period = 0;
+	double delta_phase = 1;
+
+	// find cache to recall the previous pos and phase.
+	struct pos_phase_cache {
+		pos_phase_velvet curr, prev;
+		int32_t prev_milliframe;
+	};
+	int cache_exists_flag;
+	pos_phase_cache* const cache = reinterpret_cast<pos_phase_cache*>(exedit.get_or_create_cache(
+		efp->processing, sizeof(pos_phase_cache) / alignof(pos_phase_cache), 1, 8 * alignof(pos_phase_cache),
+		0, &cache_exists_flag));
+
+	// ref: https://github.com/nazonoSAUNA/simple_wave.eef/blob/main/src.cpp
+	auto curr_milliframe = 1000 * (efpip->frame + efpip->add_frame);
+	bool is_head = false;
+	if (efpip->audio_speed != 0) {
+		curr_milliframe = efpip->audio_milliframe - 1000 * (efpip->frame_num - efpip->frame);
+		auto const
+			speed = 0.000'001 * efpip->audio_speed,
+			frame = 0.001 * curr_milliframe;
+
+		delta_phase *= std::abs(speed);
+		if (speed >= 0 ? frame - speed < 0 : frame - speed >= efpip->frame_n) // 想定の前回描画フレームが範囲外．
+			is_head = true;
+	}
+	else if (curr_milliframe == 0) is_head = true; // 1フレーム目
+	if (is_head || cache_exists_flag == 0 || cache == nullptr ||
+		(efpip->audio_speed >= 0 ?
+			curr_milliframe < cache->prev_milliframe :
+			curr_milliframe > cache->prev_milliframe)) {
+		pos = 0;
+		phase = 0;
+		count_period = 0;
+		phase_period = 0;
+	}
+	else {
+		pos = cache->curr.pos;
+		phase = cache->curr.phase;
+		count_period = cache->curr.count_period;
+		phase_period = cache->curr.phase_period;
+	}
+
+	if (cache != nullptr) {
+		// rewind the position and phase if re-rendering the same frame.
+		if (cache_exists_flag != 0 && (phase > 0 || pos > 0) &&
+			curr_milliframe == cache->prev_milliframe) {
+			pos = cache->prev.pos;
+			phase = cache->prev.phase;
+			count_period = cache->prev.count_period;
+			phase_period = cache->prev.phase_period;
+		}
+
+		cache->prev_milliframe = curr_milliframe;
+		cache->curr = cache->prev = {
+			pos,
+			std::isfinite(phase) && 0 < phase && phase < 1 ? phase : 0,
+			count_period,
+			std::isfinite(phase_period) && 0 < phase_period && phase_period < 1 ? phase_period : 0,
+		};
+	}
+
+	return { delta_phase, cache == nullptr ? nullptr : &cache->curr };
+}
+
+BOOL velvet::func_proc(ExEdit::Filter* efp, ExEdit::FilterProcInfo* efpip)
+{
+	int constexpr
+		min_period	= track_min		[idx_track::period],
+		max_period	= track_max		[idx_track::period],
+		min_alpha	= track_min		[idx_track::alpha],
+		max_alpha	= track_max		[idx_track::alpha],
+		den_alpha	= track_denom	[idx_track::alpha],
+		min_back	= track_min		[idx_track::back_volume],
+		max_back	= track_max		[idx_track::back_volume],
+		den_back	= track_denom	[idx_track::back_volume];
+
+	// prepare paramters.
+	int const
+		raw_period	= efp->track	[idx_track::period],
+		raw_alpha	= efp->track	[idx_track::alpha],
+		raw_back	= efp->track	[idx_track::back_volume];
+	bool const
+		stereo		= efp->check	[idx_check::stereo] != 0;
+	Exdata* const exdata = reinterpret_cast<Exdata*>(efp->exdata_ptr);
+
+	uint32_t const
+		period		= std::clamp(raw_period, min_period, max_period);
+	float const
+		alpha		= std::clamp(raw_alpha, min_alpha, max_alpha) / static_cast<float>(100 * den_alpha);
+	float const
+		back_volume	= std::clamp(raw_back, min_back, max_back) / static_cast<float>(100 * den_back);
+	uint32_t const
+		seed		= calc_seed(exdata->seed, efp),
+		fft_size	= exdata->clamped_fft_size();
+
+	// recall previous state.
+	auto [delta_phase, pos_phase_ptr] = adjust_pos_phase_velvet(efp, efpip);
+	auto [pos, phase, count_period, phase_period] = pos_phase_ptr != nullptr ? *pos_phase_ptr : pos_phase_velvet{};
+
+	// generate noise.
+	auto step_one = lambda_step_one(phase, delta_phase);
+	auto val = [](velvet_noise const& gen) { return to_int(gen.value()); };
+	set_noise_gen_space(efpip);
+	int16_t* const data = efpip->audio_data;
+	if (stereo && efpip->audio_ch == 2) {
+		// prepare two noise generators.
+		velvet_noise
+			genL{ period, alpha, fft_size, seed, pos, count_period, phase_period },
+			genR{ period, alpha, fft_size, ~seed, pos, count_period, phase_period, 1 };
+
+		// write values to the buffer.
+		for (int i = 0; i < efpip->audio_n; i++) {
+			step_one(genL, genR);
+			data[2 * i + 0] = val(genL);
+			data[2 * i + 1] = val(genR);
+		}
+
+		// update the states.
+		pos = genL.pos;
+		count_period = genL.count_period;
+		phase_period = genL.phase_period();
+	}
+	else {
+		// prepare a noise generator.
+		velvet_noise gen{ period, alpha, fft_size, seed, pos, count_period, phase_period };
+
+		// write values to the buffer.
+		if (efpip->audio_ch == 2) {
+			for (int i = 0; i < efpip->audio_n; i++) {
+				step_one(gen);
+				data[2 * i] = data[2 * i + 1] = val(gen);
+			}
+		}
+		else {
+			for (int i = 0; i < efpip->audio_n; i++) {
+				step_one(gen);
+				data[i] = val(gen);
+			}
+		}
+
+		// update the states.
+		pos = gen.pos;
+		count_period = gen.count_period;
+		phase_period = gen.phase_period();
+	}
+
+	// lower (or possibly gain) the sound already rendered.
+	if (back_volume != 1.0f) {
+		for (int i = efpip->audio_ch * efpip->audio_n; --i >= 0;) {
+			auto& p = efpip->audio_p[i];
+			p = static_cast<int16_t>(std::lround(back_volume * p));
+		}
+	}
+
+	// store the states for the next use.
+	if (pos_phase_ptr != nullptr) *pos_phase_ptr = { pos, phase, count_period, phase_period };
 
 	return TRUE;
 }
@@ -1090,6 +1503,7 @@ EXTERN_C __declspec(dllexport) ExEdit::Filter* const* __stdcall GetFilterTableLi
 		&noise::filter,
 		&noise_multiply::effect,
 		&noise_multiply::filter,
+		&velvet::filter,
 		&pulse::filter,
 		nullptr,
 	};
