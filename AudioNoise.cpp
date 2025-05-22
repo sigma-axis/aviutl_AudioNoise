@@ -92,7 +92,7 @@ struct check_data {
 	};
 };
 
-#define PLUGIN_VERSION	"v1.10-test2"
+#define PLUGIN_VERSION	"v1.10-test3"
 #define PLUGIN_AUTHOR	"sigma-axis"
 #define FILTER_INFO_FMT(name, ver, author)	(name " " ver " by " author)
 #define FILTER_INFO(name)	constexpr char filter_name[] = name, info[] = FILTER_INFO_FMT(name, PLUGIN_VERSION, PLUGIN_AUTHOR)
@@ -324,14 +324,14 @@ namespace velvet
 	FILTER_INFO("Velvet Noise");
 
 	// trackbars.
-	constexpr char const* track_names[] = { "平均周期", "指数", "背景音量" };
+	constexpr char const* track_names[] = { "平均周期", "指数", "分解能", "背景音量" };
 	constexpr int32_t
-		track_denom[]	= {    1,    100,   10 },
-		track_min[]		= {    1, -40000,    0 },
-		track_min_drag[]= {    4, -20000,    0 },
-		track_default[]	= {   16,      0, 1000 },
-		track_max_drag[]= {   64, +20000, 1000 },
-		track_max[]		= { 1000, +40000, 2000 };
+		track_denom[]	= {    1,    100,   100,   10 },
+		track_min[]		= {    1, -40000, -4800,    0 },
+		track_min_drag[]= {    4, -20000,     0,    0 },
+		track_default[]	= {   16,      0, +9600, 1000 },
+		track_max_drag[]= {   64, +20000, +7200, 1000 },
+		track_max[]		= { 1000, +40000, +9600, 2000 };
 
 	static_assert(
 		std::size(track_names) == std::size(track_denom) &&
@@ -346,6 +346,7 @@ namespace velvet
 		enum id : int {
 			period,
 			alpha,
+			resolution,
 			back_volume,
 		};
 	};
@@ -1202,11 +1203,11 @@ struct pos_phase_velvet {
 };
 // adjusts the frequency according to the playback rate,
 // and possibly reset the position and phase.
-static inline std::pair<double, pos_phase_velvet*> adjust_pos_phase_velvet(ExEdit::Filter const* efp, ExEdit::FilterProcInfo const* efpip)
+static inline std::pair<double, pos_phase_velvet*> adjust_pos_phase_velvet(double hertz, ExEdit::Filter const* efp, ExEdit::FilterProcInfo const* efpip)
 {
 	uint64_t pos = 0, count_period = 0;
 	double phase = 0, phase_period = 0;
-	double delta_phase = 1;
+	double delta_phase = hertz / efpip->audio_rate;
 
 	// find cache to recall the previous pos and phase.
 	struct pos_phase_cache {
@@ -1278,6 +1279,9 @@ BOOL velvet::func_proc(ExEdit::Filter* efp, ExEdit::FilterProcInfo* efpip)
 		min_alpha	= track_min		[idx_track::alpha],
 		max_alpha	= track_max		[idx_track::alpha],
 		den_alpha	= track_denom	[idx_track::alpha],
+		min_freq	= track_min		[idx_track::resolution],
+		max_freq	= track_max		[idx_track::resolution],
+		den_freq	= track_denom	[idx_track::resolution],
 		min_back	= track_min		[idx_track::back_volume],
 		max_back	= track_max		[idx_track::back_volume],
 		den_back	= track_denom	[idx_track::back_volume];
@@ -1286,6 +1290,7 @@ BOOL velvet::func_proc(ExEdit::Filter* efp, ExEdit::FilterProcInfo* efpip)
 	int const
 		raw_period	= efp->track	[idx_track::period],
 		raw_alpha	= efp->track	[idx_track::alpha],
+		raw_freq	= efp->track	[idx_track::resolution],
 		raw_back	= efp->track	[idx_track::back_volume];
 	bool const
 		stereo		= efp->check	[idx_check::stereo] != 0;
@@ -1295,6 +1300,8 @@ BOOL velvet::func_proc(ExEdit::Filter* efp, ExEdit::FilterProcInfo* efpip)
 		period		= std::clamp(raw_period, min_period, max_period);
 	float const
 		alpha		= std::clamp(raw_alpha, min_alpha, max_alpha) / static_cast<float>(100 * den_alpha);
+	double const
+		hertz		= calc_hertz(std::clamp(raw_freq, min_freq, max_freq) / static_cast<double>(den_freq));
 	float const
 		back_volume	= std::clamp(raw_back, min_back, max_back) / static_cast<float>(100 * den_back);
 	uint32_t const
@@ -1302,11 +1309,11 @@ BOOL velvet::func_proc(ExEdit::Filter* efp, ExEdit::FilterProcInfo* efpip)
 		fft_size	= exdata->clamped_fft_size();
 
 	// recall previous state.
-	auto [delta_phase, pos_phase_ptr] = adjust_pos_phase_velvet(efp, efpip);
+	auto [delta_phase, pos_phase_ptr] = adjust_pos_phase_velvet(hertz, efp, efpip);
 	auto [pos, phase, count_period, phase_period] = pos_phase_ptr != nullptr ? *pos_phase_ptr : pos_phase_velvet{};
 
 	// generate noise.
-	auto step_one = lambda_step_one(phase, delta_phase);
+	auto step_one = lambda_step_one(phase, raw_freq >= max_freq ? 1.0 : delta_phase);
 	auto val = [](velvet_noise const& gen) { return to_int(gen.value()); };
 	set_noise_gen_space(efpip);
 	int16_t* const data = efpip->audio_data;
