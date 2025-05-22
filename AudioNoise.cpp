@@ -92,7 +92,7 @@ struct check_data {
 	};
 };
 
-#define PLUGIN_VERSION	"v1.01-test1"
+#define PLUGIN_VERSION	"v1.10-test2"
 #define PLUGIN_AUTHOR	"sigma-axis"
 #define FILTER_INFO_FMT(name, ver, author)	(name " " ver " by " author)
 #define FILTER_INFO(name)	constexpr char filter_name[] = name, info[] = FILTER_INFO_FMT(name, PLUGIN_VERSION, PLUGIN_AUTHOR)
@@ -723,60 +723,6 @@ private:
 				-q.imag() * ptr[j].real() - q.real() * ptr[j].imag());
 		}
 	}
-
-#if false
-	// preserving continuity with white noise, which is not worth sacrificing the performance.
-	void batch()
-	{
-		// assumes alpha is nonzero.
-		// set random values to the time space.
-		auto const buf1 = fft_buf(), buf2 = buf1 + fft_size;
-		RNG rng1 = rng;
-		for (size_t i = 0; i < fft_size; i++)
-			// - tilt by `-pi i n/N` so the frequency is shifted by 0.5.
-			// - taking the complex conjugate to adapt to inverse FFT.
-			buf1[i] = rng1() * fft->q(i << red_bits);
-		rng.discard(fft_size / 2); // advance RNG by half frame.
-
-		// perform FFT.
-		auto ptr = fft->inv(buf1, buf2, fft_size);
-
-		// modify values in the frequency space.
-		float R = 0; // sum of powers.
-		for (size_t i = 0; i < fft_size / 2; i++) {
-			// bias of the colored noise.
-			auto r = std::pow(0.5f + i, -alpha / 2);
-
-			// taking the complex conjugate to adapt the former inverse FFT.
-			auto const v = r * ptr[i];
-			buf1[i] = std::conj(v);
-			buf1[fft_size - 1 - i] = v;
-
-			// sum up the powers.
-			R += r * r;
-		}
-
-		// perform inverse FFT.
-		ptr = fft->inv(buf1, buf2, fft_size);
-
-		// normalize the power.
-		float const S = 1 / std::sqrt(2 * R * fft_size);
-
-		// place the values to the destination buffer.
-		for (size_t i = 0; i < fft_size / 2; i++) {
-			auto const j = i + fft_size / 2;
-			// - tilt back by `pi i n/N`.
-			// - only the real part is in interest.
-			// - glue with the half of the previous section by Hann function.
-			auto const& q = fft->q(i << red_bits);
-			buf[i] = S * (q.imag() * q.imag()) * (
-				q.real() * ptr[i].real() - q.imag() * ptr[i].imag())
-				+ buf[j];
-			buf[j] = S * (q.real() * q.real()) * (
-				-q.imag() * ptr[j].real() - q.real() * ptr[j].imag());
-		}
-	}
-#endif
 };
 
 struct velvet_noise : colored_noise {
@@ -921,9 +867,11 @@ private:
 			auto const& q = fft->q(i << red_bits);
 			auto const hann = q.imag() * q.imag();
 			buf[i] = hann * (
+				// \Re(q p_i)
 				q.real() * ptr[i].real() - q.imag() * ptr[i].imag())
 				+ buf[j];
 			buf[j] = (1 - hann) * (
+				// \Re(\sqrt{-1}q p_j)
 				-q.imag() * ptr[j].real() - q.real() * ptr[j].imag());
 		}
 	}
