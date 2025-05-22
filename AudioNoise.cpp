@@ -92,7 +92,7 @@ struct check_data {
 	};
 };
 
-#define PLUGIN_VERSION	"v1.10-test3"
+#define PLUGIN_VERSION	"v1.10-test4"
 #define PLUGIN_AUTHOR	"sigma-axis"
 #define FILTER_INFO_FMT(name, ver, author)	(name " " ver " by " author)
 #define FILTER_INFO(name)	constexpr char filter_name[] = name, info[] = FILTER_INFO_FMT(name, PLUGIN_VERSION, PLUGIN_AUTHOR)
@@ -214,12 +214,14 @@ namespace noise
 	};
 
 	// constants.
-	constexpr int std_height = -(std::numeric_limits<int16_t>::min() >> 3);
-	inline/*constexpr*/ int16_t to_int(std::floating_point auto x) {
+	template<int std_height>
+	inline/*constexpr*/ int16_t to_int_t(std::floating_point auto x) {
 		using lim = std::numeric_limits<int16_t>;
 		return static_cast<int16_t>(std::lround(std::clamp<decltype(x)>(
 			std_height * x, lim::min(), lim::max())));
 	}
+	constexpr int std_height = -(std::numeric_limits<int16_t>::min() >> 3);
+	constexpr auto to_int(auto x) { return to_int_t<std_height>(x); }
 }
 
 namespace noise_multiply
@@ -324,14 +326,14 @@ namespace velvet
 	FILTER_INFO("Velvet Noise");
 
 	// trackbars.
-	constexpr char const* track_names[] = { "平均周期", "指数", "分解能", "背景音量" };
+	constexpr char const* track_names[] = { "密度", "指数", "分解能", "背景音量" };
 	constexpr int32_t
-		track_denom[]	= {    1,    100,   100,   10 },
-		track_min[]		= {    1, -40000, -4800,    0 },
-		track_min_drag[]= {    4, -20000,     0,    0 },
-		track_default[]	= {   16,      0, +9600, 1000 },
-		track_max_drag[]= {   64, +20000, +7200, 1000 },
-		track_max[]		= { 1000, +40000, +9600, 2000 };
+		track_denom[]	= {   100,    100,   100,   10 },
+		track_min[]		= { -4800, -40000, -4800,    0 },
+		track_min_drag[]= {     0, -20000,     0,    0 },
+		track_default[]	= { +3300,      0, +9600, 1000 },
+		track_max_drag[]= { +7200, +20000, +7200, 1000 },
+		track_max[]		= { +9600, +40000, +9600, 2000 };
 
 	static_assert(
 		std::size(track_names) == std::size(track_denom) &&
@@ -344,7 +346,7 @@ namespace velvet
 	namespace idx_track
 	{
 		enum id : int {
-			period,
+			fuzzy,
 			alpha,
 			resolution,
 			back_volume,
@@ -405,7 +407,9 @@ namespace velvet
 	};
 
 	// constants.
-	using noise::std_height, noise::to_int;
+	using noise::to_int_t;
+	constexpr int std_height = noise::std_height << 2;
+	constexpr auto to_int(auto x) { return to_int_t<std_height>(x); }
 }
 
 namespace pulse
@@ -1030,7 +1034,8 @@ BOOL noise::func_proc(ExEdit::Filter* efp, ExEdit::FilterProcInfo* efpip)
 	double const& phase_ref = interpolate ? phase : const_0;
 
 	// generate noise.
-	auto step_one = lambda_step_one(phase, raw_freq >= max_freq ? 1.0 : delta_phase);
+	double const delta_phase_corr = raw_freq >= max_freq ? 1.0 : delta_phase;
+	auto step_one = lambda_step_one(phase, delta_phase_corr);
 	auto val = [&phase_ref](powered_noise const& gen) { return to_int(gen.value(static_cast<float>(phase_ref))); };
 	set_noise_gen_space(efpip);
 	int16_t* const data = efpip->audio_data;
@@ -1136,7 +1141,8 @@ BOOL noise_multiply::func_proc(ExEdit::Filter* efp, ExEdit::FilterProcInfo* efpi
 	double const& phase_ref = interpolate ? phase : const_0;
 
 	// filter by noise.
-	auto step_one = lambda_step_one(phase, raw_freq >= max_freq ? 1.0 : delta_phase);
+	double const delta_phase_corr = raw_freq >= max_freq ? 1.0 : delta_phase;
+	auto step_one = lambda_step_one(phase, delta_phase_corr);
 	auto val = [&phase_ref](powered_noise const& gen) { return gen.value(static_cast<float>(phase_ref)); };
 	auto bound = [=, dyn_range = std::max(u_bound - l_bound, 0.0f)](float noise) {
 		auto const ret = dyn_range <= 0 ?
@@ -1274,8 +1280,9 @@ static inline std::pair<double, pos_phase_velvet*> adjust_pos_phase_velvet(doubl
 BOOL velvet::func_proc(ExEdit::Filter* efp, ExEdit::FilterProcInfo* efpip)
 {
 	int constexpr
-		min_period	= track_min		[idx_track::period],
-		max_period	= track_max		[idx_track::period],
+		min_fuzzy	= track_min		[idx_track::fuzzy],
+		max_fuzzy	= track_max		[idx_track::fuzzy],
+		den_fuzzy	= track_denom	[idx_track::fuzzy],
 		min_alpha	= track_min		[idx_track::alpha],
 		max_alpha	= track_max		[idx_track::alpha],
 		den_alpha	= track_denom	[idx_track::alpha],
@@ -1288,7 +1295,7 @@ BOOL velvet::func_proc(ExEdit::Filter* efp, ExEdit::FilterProcInfo* efpip)
 
 	// prepare paramters.
 	int const
-		raw_period	= efp->track	[idx_track::period],
+		raw_fuzzy	= efp->track	[idx_track::fuzzy],
 		raw_alpha	= efp->track	[idx_track::alpha],
 		raw_freq	= efp->track	[idx_track::resolution],
 		raw_back	= efp->track	[idx_track::back_volume];
@@ -1296,8 +1303,8 @@ BOOL velvet::func_proc(ExEdit::Filter* efp, ExEdit::FilterProcInfo* efpip)
 		stereo		= efp->check	[idx_check::stereo] != 0;
 	Exdata* const exdata = reinterpret_cast<Exdata*>(efp->exdata_ptr);
 
-	uint32_t const
-		period		= std::clamp(raw_period, min_period, max_period);
+	double const
+		taps_hertz	= calc_hertz(std::clamp(raw_fuzzy, min_fuzzy, max_fuzzy) / static_cast<double>(den_fuzzy));
 	float const
 		alpha		= std::clamp(raw_alpha, min_alpha, max_alpha) / static_cast<float>(100 * den_alpha);
 	double const
@@ -1313,7 +1320,10 @@ BOOL velvet::func_proc(ExEdit::Filter* efp, ExEdit::FilterProcInfo* efpip)
 	auto [pos, phase, count_period, phase_period] = pos_phase_ptr != nullptr ? *pos_phase_ptr : pos_phase_velvet{};
 
 	// generate noise.
-	auto step_one = lambda_step_one(phase, raw_freq >= max_freq ? 1.0 : delta_phase);
+	double const delta_phase_corr = raw_freq >= max_freq ? 1.0 : delta_phase;
+	uint32_t const period = raw_fuzzy >= max_fuzzy ? 1 :
+		std::max<uint32_t>(std::lround(delta_phase_corr * efpip->audio_rate / taps_hertz), 1);
+	auto step_one = lambda_step_one(phase, delta_phase_corr);
 	auto val = [](velvet_noise const& gen) { return to_int(gen.value()); };
 	set_noise_gen_space(efpip);
 	int16_t* const data = efpip->audio_data;
