@@ -92,7 +92,7 @@ struct check_data {
 	};
 };
 
-#define PLUGIN_VERSION	"v1.10-test4"
+#define PLUGIN_VERSION	"v1.10-test5"
 #define PLUGIN_AUTHOR	"sigma-axis"
 #define FILTER_INFO_FMT(name, ver, author)	(name " " ver " by " author)
 #define FILTER_INFO(name)	constexpr char filter_name[] = name, info[] = FILTER_INFO_FMT(name, PLUGIN_VERSION, PLUGIN_AUTHOR)
@@ -777,7 +777,7 @@ struct velvet_noise : colored_noise {
 	float value() const {
 		if (alpha == 0)
 			return pos_period == pos_pulse ? neg_pulse ? -1.0f : 1.0f : 0.0f;
-		else return buf[pos & (fft_size / 2 - 1)];
+		else return buf[get_index(pos)];
 	}
 	void move_next() {
 		pos++; pos_period++;
@@ -790,7 +790,7 @@ struct velvet_noise : colored_noise {
 			if (pos_period == 0) set_next();
 		}
 		else {
-			if ((pos & (fft_size / 2 - 1)) == 0) batch(pos_period);
+			if (get_index(pos) == 0) batch(pos_period);
 		}
 	}
 	double phase_period() const { return pos_period / static_cast<double>(period); }
@@ -805,12 +805,7 @@ private:
 	bool neg_pulse;
 	float* const buf;
 
-	std::pair<uint32_t, bool> parse_rand(uint32_t r) const {
-		return {
-			static_cast<uint32_t>((period * static_cast<uint64_t>(r & ~(1u << 31))) >> 31),
-			(r & (1u << 31)) != 0
-		};
-	}
+	size_t get_index(uint_fast64_t p) const { return p & ((fft_size / 2) - 1); }
 
 	void set_next() { std::tie(pos_pulse, neg_pulse) = parse_rand(rng()); }
 	void batch(uint_fast64_t pos_period_0)
@@ -879,6 +874,14 @@ private:
 				// \Re(\sqrt{-1}q p_j)
 				-q.imag() * ptr[j].real() - q.real() * ptr[j].imag());
 		}
+	}
+
+	std::pair<uint32_t, bool> parse_rand(uint32_t r) const { return parse_rand(r, period); }
+	constexpr static std::pair<uint32_t, bool> parse_rand(uint32_t r, uint32_t period) {
+		return {
+			static_cast<uint32_t>((period * static_cast<uint64_t>(r & ~(1u << 31))) >> 31),
+			(r & (1u << 31)) != 0
+		};
 	}
 };
 
@@ -975,7 +978,7 @@ static constexpr auto lambda_step_one(double& phase, double delta) {
 	return [&phase, delta](auto&... gen) {
 		phase += delta;
 		if (phase >= 1) {
-			phase -= std::floor(static_cast<float>(phase));
+			phase -= std::floor(phase);
 			(gen.move_next(), ...);
 		}
 	};
@@ -1079,10 +1082,8 @@ BOOL noise::func_proc(ExEdit::Filter* efp, ExEdit::FilterProcInfo* efpip)
 
 	// lower (or possibly gain) the sound already rendered.
 	if (back_volume != 1.0f) {
-		for (int i = efpip->audio_ch * efpip->audio_n; --i >= 0;) {
-			auto& p = efpip->audio_p[i];
-			p = static_cast<int16_t>(std::lround(back_volume * p));
-		}
+		for (auto p = efpip->audio_p, e = p + efpip->audio_ch * efpip->audio_n; p < e; p++)
+			*p = static_cast<int16_t>(std::lround(back_volume * *p));
 	}
 
 	// store the phase and the position for the next use.
@@ -1371,10 +1372,8 @@ BOOL velvet::func_proc(ExEdit::Filter* efp, ExEdit::FilterProcInfo* efpip)
 
 	// lower (or possibly gain) the sound already rendered.
 	if (back_volume != 1.0f) {
-		for (int i = efpip->audio_ch * efpip->audio_n; --i >= 0;) {
-			auto& p = efpip->audio_p[i];
-			p = static_cast<int16_t>(std::lround(back_volume * p));
-		}
+		for (auto p = efpip->audio_p, e = p + efpip->audio_ch * efpip->audio_n; p < e; p++)
+			*p = static_cast<int16_t>(std::lround(back_volume * *p));
 	}
 
 	// store the states for the next use.
