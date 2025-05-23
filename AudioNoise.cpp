@@ -92,7 +92,7 @@ struct check_data {
 	};
 };
 
-#define PLUGIN_VERSION	"v1.10-test6"
+#define PLUGIN_VERSION	"v1.10-test7"
 #define PLUGIN_AUTHOR	"sigma-axis"
 #define FILTER_INFO_FMT(name, ver, author)	(name " " ver " by " author)
 #define FILTER_INFO(name)	constexpr char filter_name[] = name, info[] = FILTER_INFO_FMT(name, PLUGIN_VERSION, PLUGIN_AUTHOR)
@@ -623,8 +623,7 @@ struct powered_noise : colored_noise {
 	powered_noise(float alpha, uint32_t fft_size, uint32_t seed, uint_fast64_t pos, size_t alt = 0)
 		: alpha{ alpha }
 		, fft_size{ alpha == 0 ? 2 /* to let `get_index()` always return 0 */ : fft_size }
-		, buf{ alpha == 0 ?
-			reinterpret_cast<float*>(memory_ptr) + 2 * alt + 1 :
+		, buf{ alpha == 0 ? reinterpret_cast<float*>(memory_ptr) + alt :
 			(wt_tbl(fft_size) + (fft_size / 2)) + (1 + fft_size) * alt + 1 }
 		, pos{ pos }, rng{ seed }
 		, red_bits{ std::bit_width(max_fft_size) - std::bit_width(fft_size) }
@@ -647,17 +646,11 @@ struct powered_noise : colored_noise {
 			rng.discard((2 * pos) & (0uLL - fft_size));
 			batch(); // pass 1.
 			batch(); // pass 2.
-			curr_value() = buf[get_index(pos)];
 		}
-		move_next_core();
 	}
 
-	float value(float phase) const {
-		return phase == 0 ? curr_value() :
-			(1 - phase) * curr_value() + phase * next_value();
-	}
+	float value() const { return curr_value(); }
 	void move_next() {
-		curr_value() = next_value();
 		pos++;
 		move_next_core();
 	}
@@ -673,13 +666,10 @@ private:
 
 	// call this *after* incrementing pos.
 	void move_next_core() {
-		if (alpha == 0) next_value() = rng();
-		else if (get_index(pos + 1) == 0) batch();
+		if (alpha == 0) curr_value() = rng();
+		else if (get_index(pos) == 0) batch();
 	}
-	float& curr_value() const { return buf[-1]; }
-	float& next_value() const {
-		return buf[get_index(pos + 1)];
-	}
+	float& curr_value() const { return buf[get_index(pos)]; }
 	size_t get_index(uint_fast64_t p) const { return p & ((fft_size / 2) - 1); }
 
 	void batch()
@@ -894,23 +884,33 @@ static inline uint32_t calc_seed(int32_t seed, ExEdit::Filter const* efp)
 struct pos_phase {
 	uint64_t pos;
 	double phase;
+
+	constexpr bool is_default() const { return pos == 0 && phase == 0; }
+	constexpr auto& normalize() {
+		phase = std::isfinite(phase) && 0 < phase && phase < 1 ? phase : 0;
+		return *this;
+	}
+	constexpr void rewind_one() {
+		// rewind the state by one step to adapt read-forward behavior for interpolation.
+		pos--;
+	}
 };
 // adjusts the frequency according to the playback rate,
-// and possibly reset the position and phase.
-static inline std::pair<double, pos_phase*> adjust_pos_phase(double hertz, ExEdit::Filter const* efp, ExEdit::FilterProcInfo const* efpip)
+// and possibly reset the state of noise.
+template<class noise_state>
+static inline std::pair<double, noise_state*> adjust_pos_phase(double hertz, ExEdit::Filter const* efp, ExEdit::FilterProcInfo const* efpip)
 {
-	uint64_t pos = 0;
-	double phase = 0;
+	noise_state state{};
 	double delta_phase = hertz / efpip->audio_rate;
 
 	// find cache to recall the previous pos and phase.
-	struct pos_phase_cache {
-		pos_phase curr, prev;
+	struct state_cache {
+		noise_state curr, prev;
 		int32_t prev_milliframe;
 	};
 	int cache_exists_flag;
-	pos_phase_cache* const cache = reinterpret_cast<pos_phase_cache*>(exedit.get_or_create_cache(
-		efp->processing, sizeof(pos_phase_cache) / alignof(pos_phase_cache), 1, 8 * alignof(pos_phase_cache),
+	state_cache* const cache = reinterpret_cast<state_cache*>(exedit.get_or_create_cache(
+		efp->processing, sizeof(state_cache) / alignof(state_cache), 1, 8 * alignof(state_cache),
 		0, &cache_exists_flag));
 
 	// ref: https://github.com/nazonoSAUNA/simple_wave.eef/blob/main/src.cpp
@@ -927,31 +927,20 @@ static inline std::pair<double, pos_phase*> adjust_pos_phase(double hertz, ExEdi
 			is_head = true;
 	}
 	else if (curr_milliframe == 0) is_head = true; // 1フレーム目
-	if (is_head || cache_exists_flag == 0 || cache == nullptr ||
+	if (!is_head && cache_exists_flag != 0 && cache != nullptr &&
 		(efpip->audio_speed >= 0 ?
-			curr_milliframe < cache->prev_milliframe :
-			curr_milliframe > cache->prev_milliframe)) {
-		pos = 0;
-		phase = 0;
-	}
-	else {
-		pos = cache->curr.pos;
-		phase = cache->curr.phase;
-	}
+			curr_milliframe >= cache->prev_milliframe :
+			curr_milliframe <= cache->prev_milliframe))
+		state = cache->curr;
 
 	if (cache != nullptr) {
 		// rewind the position and phase if re-rendering the same frame.
-		if (cache_exists_flag != 0 && (phase > 0 || pos > 0) &&
-			curr_milliframe == cache->prev_milliframe) {
-			pos = cache->prev.pos;
-			phase = cache->prev.phase;
-		}
+		if (cache_exists_flag != 0 && !state.is_default() &&
+			curr_milliframe == cache->prev_milliframe)
+			state = cache->prev;
 
 		cache->prev_milliframe = curr_milliframe;
-		cache->curr = cache->prev = {
-			pos,
-			std::isfinite(phase) && 0 < phase && phase < 1 ? phase : 0
-		};
+		cache->curr = cache->prev = state.normalize();
 	}
 
 	return { delta_phase, cache == nullptr ? nullptr : &cache->curr };
@@ -959,15 +948,6 @@ static inline std::pair<double, pos_phase*> adjust_pos_phase(double hertz, ExEdi
 
 // helper lambda to control phasing.
 static constexpr auto lambda_step_one(double& phase, double delta) {
-	return [&phase, delta](auto&... gen) {
-		phase += delta;
-		if (phase >= 1) {
-			phase -= std::floor(phase);
-			(gen.move_next(), ...);
-		}
-	};
-}
-static constexpr auto lambda_step_one2(double& phase, double delta) {
 	return [&phase, delta](auto&... args) {
 		static_assert(sizeof...(args) % 2 == 0);
 
@@ -1031,15 +1011,18 @@ BOOL noise::func_proc(ExEdit::Filter* efp, ExEdit::FilterProcInfo* efpip)
 		fft_size	= exdata->clamped_fft_size();
 
 	// recall previous state.
-	auto [delta_phase, pos_phase_ptr] = adjust_pos_phase(hertz, efp, efpip);
-	auto [pos, phase] = pos_phase_ptr != nullptr ? *pos_phase_ptr : pos_phase{};
+	auto [delta_phase, state_ptr] = adjust_pos_phase<pos_phase>(hertz, efp, efpip);
+	auto [pos, phase] = state_ptr != nullptr ? *state_ptr : std::decay_t<decltype(*state_ptr)>{};
 	constexpr double const_0 = 0;
 	double const& phase_ref = interpolate ? phase : const_0;
 
 	// generate noise.
 	double const delta_phase_corr = raw_freq >= max_freq ? 1.0 : delta_phase;
 	auto step_one = lambda_step_one(phase, delta_phase_corr);
-	auto val = [&phase_ref](powered_noise const& gen) { return to_int(gen.value(static_cast<float>(phase_ref))); };
+	auto val = [&phase_ref](powered_noise const& gen, float prev) {
+		auto const t = static_cast<float>(phase_ref);
+		return to_int((1 - t) * prev + t * gen.value());
+	};
 	set_noise_gen_space(efpip);
 	int16_t* const data = efpip->audio_data;
 	if (stereo && efpip->audio_ch == 2) {
@@ -1047,12 +1030,14 @@ BOOL noise::func_proc(ExEdit::Filter* efp, ExEdit::FilterProcInfo* efpip)
 		powered_noise
 			genL{ alpha, fft_size, seed, pos },
 			genR{ alpha, fft_size, ~seed, pos, 1 };
+		float prevL = genL.value(), prevR = genR.value();
+		genL.move_next(); genR.move_next();
 
 		// write values to the buffer.
 		for (int i = 0; i < efpip->audio_n; i++) {
-			step_one(genL, genR);
-			data[2 * i + 0] = val(genL);
-			data[2 * i + 1] = val(genR);
+			step_one(genL, prevL, genR, prevR);
+			data[2 * i + 0] = val(genL, prevL);
+			data[2 * i + 1] = val(genR, prevR);
 		}
 
 		// update the position.
@@ -1061,18 +1046,19 @@ BOOL noise::func_proc(ExEdit::Filter* efp, ExEdit::FilterProcInfo* efpip)
 	else {
 		// prepare a noise generator.
 		powered_noise gen{ alpha, fft_size, seed, pos };
+		float prev = gen.value(); gen.move_next();
 
 		// write values to the buffer.
 		if (efpip->audio_ch == 2) {
 			for (int i = 0; i < efpip->audio_n; i++) {
-				step_one(gen);
-				data[2 * i] = data[2 * i + 1] = val(gen);
+				step_one(gen, prev);
+				data[2 * i] = data[2 * i + 1] = val(gen, prev);
 			}
 		}
 		else {
 			for (int i = 0; i < efpip->audio_n; i++) {
-				step_one(gen);
-				data[i] = val(gen);
+				step_one(gen, prev);
+				data[i] = val(gen, prev);
 			}
 		}
 
@@ -1087,7 +1073,10 @@ BOOL noise::func_proc(ExEdit::Filter* efp, ExEdit::FilterProcInfo* efpip)
 	}
 
 	// store the phase and the position for the next use.
-	if (pos_phase_ptr != nullptr) *pos_phase_ptr = { pos, phase };
+	if (state_ptr != nullptr) {
+		*state_ptr = { pos, phase };
+		state_ptr->rewind_one();
+	}
 
 	return TRUE;
 }
@@ -1136,15 +1125,18 @@ BOOL noise_multiply::func_proc(ExEdit::Filter* efp, ExEdit::FilterProcInfo* efpi
 		fft_size	= exdata->clamped_fft_size();
 
 	// recall previous state.
-	auto [delta_phase, pos_phase_ptr] = adjust_pos_phase(hertz, efp, efpip);
-	auto [pos, phase] = pos_phase_ptr != nullptr ? *pos_phase_ptr : pos_phase{};
+	auto [delta_phase, state_ptr] = adjust_pos_phase<pos_phase>(hertz, efp, efpip);
+	auto [pos, phase] = state_ptr != nullptr ? *state_ptr : std::decay_t<decltype(*state_ptr)>{};
 	constexpr double const_0 = 0;
 	double const& phase_ref = interpolate ? phase : const_0;
 
 	// filter by noise.
 	double const delta_phase_corr = raw_freq >= max_freq ? 1.0 : delta_phase;
 	auto step_one = lambda_step_one(phase, delta_phase_corr);
-	auto val = [&phase_ref](powered_noise const& gen) { return gen.value(static_cast<float>(phase_ref)); };
+	auto val = [&phase_ref](powered_noise const& gen, float prev) {
+		auto const t = static_cast<float>(phase_ref);
+		return (1 - t) * prev + t * gen.value();
+	};
 	auto bound = [=, dyn_range = std::max(u_bound - l_bound, 0.0f)](float noise) {
 		auto const ret = dyn_range <= 0 ?
 			std::abs(noise) <= l_bound ? 0.0f : 1.0f :
@@ -1163,12 +1155,14 @@ BOOL noise_multiply::func_proc(ExEdit::Filter* efp, ExEdit::FilterProcInfo* efpi
 		powered_noise
 			genL{ alpha, fft_size, seed, pos },
 			genR{ alpha, fft_size, ~seed, pos, 1 };
+		float prevL = genL.value(), prevR = genR.value();
+		genL.move_next(); genR.move_next();
 
 		// write values to the buffer.
 		for (int i = 0; i < efpip->audio_n; i++) {
-			step_one(genL, genR);
-			mix(val(genL), data[2 * i + 0]);
-			mix(val(genR), data[2 * i + 1]);
+			step_one(genL, prevL, genR, prevR);
+			mix(val(genL, prevL), data[2 * i + 0]);
+			mix(val(genR, prevR), data[2 * i + 1]);
 		}
 
 		// update the position.
@@ -1177,18 +1171,19 @@ BOOL noise_multiply::func_proc(ExEdit::Filter* efp, ExEdit::FilterProcInfo* efpi
 	else {
 		// prepare a noise generator.
 		powered_noise gen{ alpha, fft_size, seed, pos };
+		float prev = gen.value(); gen.move_next();
 
 		// write values to the buffer.
 		if (efpip->audio_ch == 2) {
 			for (int i = 0; i < efpip->audio_n; i++) {
-				step_one(gen);
-				mix(val(gen), data[2 * i], data[2 * i + 1]);
+				step_one(gen, prev);
+				mix(val(gen, prev), data[2 * i], data[2 * i + 1]);
 			}
 		}
 		else {
 			for (int i = 0; i < efpip->audio_n; i++) {
-				step_one(gen);
-				mix(val(gen), data[i]);
+				step_one(gen, prev);
+				mix(val(gen, prev), data[i]);
 			}
 		}
 
@@ -1197,7 +1192,10 @@ BOOL noise_multiply::func_proc(ExEdit::Filter* efp, ExEdit::FilterProcInfo* efpi
 	}
 
 	// store the phase and the position for the next use.
-	if (pos_phase_ptr != nullptr) *pos_phase_ptr = { pos, phase };
+	if (state_ptr != nullptr) {
+		*state_ptr = { pos, phase };
+		state_ptr->rewind_one();
+	}
 
 	return TRUE;
 }
@@ -1208,7 +1206,13 @@ struct pos_phase_velvet {
 	uint64_t count_period;
 	double phase_period;
 
-	void rewind_one(uint32_t period) {
+	constexpr bool is_default() const { return pos == 0 && phase == 0 && count_period == 0 && phase_period == 0; }
+	constexpr auto& normalize() {
+		phase = std::isfinite(phase) && 0 < phase && phase < 1 ? phase : 0;
+		phase_period = std::isfinite(phase_period) && 0 < phase_period && phase_period < 1 ? phase_period : 0;
+		return *this;
+	}
+	constexpr void rewind_one(uint32_t period) {
 		// rewind the state by one step to adapt read-forward behavior for interpolation.
 		pos--;
 		phase_period -= 1.0 / period;
@@ -1219,75 +1223,6 @@ struct pos_phase_velvet {
 		}
 	}
 };
-// adjusts the frequency according to the playback rate,
-// and possibly reset the position and phase.
-static inline std::pair<double, pos_phase_velvet*> adjust_pos_phase_velvet(double hertz, ExEdit::Filter const* efp, ExEdit::FilterProcInfo const* efpip)
-{
-	uint64_t pos = 0, count_period = 0;
-	double phase = 0, phase_period = 0;
-	double delta_phase = hertz / efpip->audio_rate;
-
-	// find cache to recall the previous pos and phase.
-	struct pos_phase_cache {
-		pos_phase_velvet curr, prev;
-		int32_t prev_milliframe;
-	};
-	int cache_exists_flag;
-	pos_phase_cache* const cache = reinterpret_cast<pos_phase_cache*>(exedit.get_or_create_cache(
-		efp->processing, sizeof(pos_phase_cache) / alignof(pos_phase_cache), 1, 8 * alignof(pos_phase_cache),
-		0, &cache_exists_flag));
-
-	// ref: https://github.com/nazonoSAUNA/simple_wave.eef/blob/main/src.cpp
-	auto curr_milliframe = 1000 * (efpip->frame + efpip->add_frame);
-	bool is_head = false;
-	if (efpip->audio_speed != 0) {
-		curr_milliframe = efpip->audio_milliframe - 1000 * (efpip->frame_num - efpip->frame);
-		auto const
-			speed = 0.000'001 * efpip->audio_speed,
-			frame = 0.001 * curr_milliframe;
-
-		delta_phase *= std::abs(speed);
-		if (speed >= 0 ? frame - speed < 0 : frame - speed >= efpip->frame_n) // 想定の前回描画フレームが範囲外．
-			is_head = true;
-	}
-	else if (curr_milliframe == 0) is_head = true; // 1フレーム目
-	if (is_head || cache_exists_flag == 0 || cache == nullptr ||
-		(efpip->audio_speed >= 0 ?
-			curr_milliframe < cache->prev_milliframe :
-			curr_milliframe > cache->prev_milliframe)) {
-		pos = 0;
-		phase = 0;
-		count_period = 0;
-		phase_period = 0;
-	}
-	else {
-		pos = cache->curr.pos;
-		phase = cache->curr.phase;
-		count_period = cache->curr.count_period;
-		phase_period = cache->curr.phase_period;
-	}
-
-	if (cache != nullptr) {
-		// rewind the position and phase if re-rendering the same frame.
-		if (cache_exists_flag != 0 && (phase > 0 || pos > 0) &&
-			curr_milliframe == cache->prev_milliframe) {
-			pos = cache->prev.pos;
-			phase = cache->prev.phase;
-			count_period = cache->prev.count_period;
-			phase_period = cache->prev.phase_period;
-		}
-
-		cache->prev_milliframe = curr_milliframe;
-		cache->curr = cache->prev = {
-			pos,
-			std::isfinite(phase) && 0 < phase && phase < 1 ? phase : 0,
-			count_period,
-			std::isfinite(phase_period) && 0 < phase_period && phase_period < 1 ? phase_period : 0,
-		};
-	}
-
-	return { delta_phase, cache == nullptr ? nullptr : &cache->curr };
-}
 
 BOOL velvet::func_proc(ExEdit::Filter* efp, ExEdit::FilterProcInfo* efpip)
 {
@@ -1329,8 +1264,8 @@ BOOL velvet::func_proc(ExEdit::Filter* efp, ExEdit::FilterProcInfo* efpip)
 		fft_size	= exdata->clamped_fft_size();
 
 	// recall previous state.
-	auto [delta_phase, pos_phase_ptr] = adjust_pos_phase_velvet(hertz, efp, efpip);
-	auto [pos, phase, count_period, phase_period] = pos_phase_ptr != nullptr ? *pos_phase_ptr : pos_phase_velvet{};
+	auto [delta_phase, state_ptr] = adjust_pos_phase<pos_phase_velvet>(hertz, efp, efpip);
+	auto [pos, phase, count_period, phase_period] = state_ptr != nullptr ? *state_ptr : pos_phase_velvet{};
 	constexpr double const_0 = 0;
 	double const& phase_ref = interpolate ? phase : const_0;
 
@@ -1338,7 +1273,7 @@ BOOL velvet::func_proc(ExEdit::Filter* efp, ExEdit::FilterProcInfo* efpip)
 	double const delta_phase_corr = raw_freq >= max_freq ? 1.0 : delta_phase;
 	uint32_t const period = raw_fuzzy >= max_fuzzy ? 1 :
 		std::max<uint32_t>(std::lround(delta_phase_corr * efpip->audio_rate / taps_hertz), 1);
-	auto step_one = lambda_step_one2(phase, delta_phase_corr);
+	auto step_one = lambda_step_one(phase, delta_phase_corr);
 	auto val = [&phase_ref](velvet_noise const& gen, float prev) {
 		auto const t = static_cast<float>(phase_ref);
 		return to_int((1 - t) * prev + t * gen.value());
@@ -1397,8 +1332,10 @@ BOOL velvet::func_proc(ExEdit::Filter* efp, ExEdit::FilterProcInfo* efpip)
 	}
 
 	// store the states for the next use.
-	if (pos_phase_ptr != nullptr)
-		pos_phase_ptr->rewind_one(period);
+	if (state_ptr != nullptr) {
+		*state_ptr = { pos, phase, count_period, phase_period };
+		state_ptr->rewind_one(period);
+	}
 
 	return TRUE;
 }
