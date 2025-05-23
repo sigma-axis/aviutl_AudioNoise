@@ -92,7 +92,7 @@ struct check_data {
 	};
 };
 
-#define PLUGIN_VERSION	"v1.10-test5"
+#define PLUGIN_VERSION	"v1.10-test6"
 #define PLUGIN_AUTHOR	"sigma-axis"
 #define FILTER_INFO_FMT(name, ver, author)	(name " " ver " by " author)
 #define FILTER_INFO(name)	constexpr char filter_name[] = name, info[] = FILTER_INFO_FMT(name, PLUGIN_VERSION, PLUGIN_AUTHOR)
@@ -354,24 +354,8 @@ namespace velvet
 	};
 
 	// checks.
-	constexpr char const* check_names[] = {
-		"ステレオ",
-		"設定...",
-	};
-	constexpr int32_t check_default[] = {
-		check_data::unchecked,
-		check_data::button,
-	};
-
-	static_assert(std::size(check_names) == std::size(check_default));
-
-	namespace idx_check
-	{
-		enum id : int {
-			stereo,
-			detail,
-		};
-	};
+	using noise::check_names, noise::check_default;
+	namespace idx_check = noise::idx_check;
 
 	// exdata.
 	using noise::Exdata, noise::exdata_def, noise::exdata_use;
@@ -983,6 +967,22 @@ static constexpr auto lambda_step_one(double& phase, double delta) {
 		}
 	};
 }
+static constexpr auto lambda_step_one2(double& phase, double delta) {
+	return [&phase, delta](auto&... args) {
+		static_assert(sizeof...(args) % 2 == 0);
+
+		phase += delta;
+		if (phase >= 1) {
+			phase -= std::floor(phase);
+			[&] <size_t... I>(std::index_sequence<I...>) {
+				((
+					(std::get<2 * I + 1>(std::forward_as_tuple(args...)) = std::get<2 * I>(std::forward_as_tuple(args...)).value()),
+					std::get<2 * I>(std::forward_as_tuple(args...)).move_next()
+					), ...);
+			}(std::make_index_sequence<sizeof...(args) / 2>{});
+		}
+	};
+}
 
 // find a suitable address to the space for noise calculations.
 static void set_noise_gen_space(ExEdit::FilterProcInfo* efpip)
@@ -1207,6 +1207,17 @@ struct pos_phase_velvet {
 	double phase;
 	uint64_t count_period;
 	double phase_period;
+
+	void rewind_one(uint32_t period) {
+		// rewind the state by one step to adapt read-forward behavior for interpolation.
+		pos--;
+		phase_period -= 1.0 / period;
+		if (phase_period < 0) {
+			auto i = std::floor(phase_period);
+			count_period += static_cast<int_fast64_t>(i);
+			phase_period -= i;
+		}
+	}
 };
 // adjusts the frequency according to the playback rate,
 // and possibly reset the position and phase.
@@ -1301,7 +1312,8 @@ BOOL velvet::func_proc(ExEdit::Filter* efp, ExEdit::FilterProcInfo* efpip)
 		raw_freq	= efp->track	[idx_track::resolution],
 		raw_back	= efp->track	[idx_track::back_volume];
 	bool const
-		stereo		= efp->check	[idx_check::stereo] != 0;
+		stereo		= efp->check	[idx_check::stereo] != 0,
+		interpolate = efp->check[idx_check::interpolate] != 0;
 	Exdata* const exdata = reinterpret_cast<Exdata*>(efp->exdata_ptr);
 
 	double const
@@ -1319,13 +1331,18 @@ BOOL velvet::func_proc(ExEdit::Filter* efp, ExEdit::FilterProcInfo* efpip)
 	// recall previous state.
 	auto [delta_phase, pos_phase_ptr] = adjust_pos_phase_velvet(hertz, efp, efpip);
 	auto [pos, phase, count_period, phase_period] = pos_phase_ptr != nullptr ? *pos_phase_ptr : pos_phase_velvet{};
+	constexpr double const_0 = 0;
+	double const& phase_ref = interpolate ? phase : const_0;
 
 	// generate noise.
 	double const delta_phase_corr = raw_freq >= max_freq ? 1.0 : delta_phase;
 	uint32_t const period = raw_fuzzy >= max_fuzzy ? 1 :
 		std::max<uint32_t>(std::lround(delta_phase_corr * efpip->audio_rate / taps_hertz), 1);
-	auto step_one = lambda_step_one(phase, delta_phase_corr);
-	auto val = [](velvet_noise const& gen) { return to_int(gen.value()); };
+	auto step_one = lambda_step_one2(phase, delta_phase_corr);
+	auto val = [&phase_ref](velvet_noise const& gen, float prev) {
+		auto const t = static_cast<float>(phase_ref);
+		return to_int((1 - t) * prev + t * gen.value());
+	};
 	set_noise_gen_space(efpip);
 	int16_t* const data = efpip->audio_data;
 	if (stereo && efpip->audio_ch == 2) {
@@ -1333,12 +1350,14 @@ BOOL velvet::func_proc(ExEdit::Filter* efp, ExEdit::FilterProcInfo* efpip)
 		velvet_noise
 			genL{ period, alpha, fft_size, seed, pos, count_period, phase_period },
 			genR{ period, alpha, fft_size, ~seed, pos, count_period, phase_period, 1 };
+		float prevL = genL.value(), prevR = genR.value();
+		genL.move_next(); genR.move_next();
 
 		// write values to the buffer.
 		for (int i = 0; i < efpip->audio_n; i++) {
-			step_one(genL, genR);
-			data[2 * i + 0] = val(genL);
-			data[2 * i + 1] = val(genR);
+			step_one(genL, prevL, genR, prevR);
+			data[2 * i + 0] = val(genL, prevL);
+			data[2 * i + 1] = val(genR, prevR);
 		}
 
 		// update the states.
@@ -1349,18 +1368,19 @@ BOOL velvet::func_proc(ExEdit::Filter* efp, ExEdit::FilterProcInfo* efpip)
 	else {
 		// prepare a noise generator.
 		velvet_noise gen{ period, alpha, fft_size, seed, pos, count_period, phase_period };
+		float prev = gen.value(); gen.move_next();
 
 		// write values to the buffer.
 		if (efpip->audio_ch == 2) {
 			for (int i = 0; i < efpip->audio_n; i++) {
-				step_one(gen);
-				data[2 * i] = data[2 * i + 1] = val(gen);
+				step_one(gen, prev);
+				data[2 * i] = data[2 * i + 1] = val(gen, prev);
 			}
 		}
 		else {
 			for (int i = 0; i < efpip->audio_n; i++) {
-				step_one(gen);
-				data[i] = val(gen);
+				step_one(gen, prev);
+				data[i] = val(gen, prev);
 			}
 		}
 
@@ -1377,7 +1397,8 @@ BOOL velvet::func_proc(ExEdit::Filter* efp, ExEdit::FilterProcInfo* efpip)
 	}
 
 	// store the states for the next use.
-	if (pos_phase_ptr != nullptr) *pos_phase_ptr = { pos, phase, count_period, phase_period };
+	if (pos_phase_ptr != nullptr)
+		pos_phase_ptr->rewind_one(period);
 
 	return TRUE;
 }
