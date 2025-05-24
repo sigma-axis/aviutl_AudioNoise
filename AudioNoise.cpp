@@ -92,7 +92,7 @@ struct check_data {
 	};
 };
 
-#define PLUGIN_VERSION	"v1.10-test8"
+#define PLUGIN_VERSION	"v1.10-beta9"
 #define PLUGIN_AUTHOR	"sigma-axis"
 #define FILTER_INFO_FMT(name, ver, author)	(name " " ver " by " author)
 #define FILTER_INFO(name)	constexpr char filter_name[] = name, info[] = FILTER_INFO_FMT(name, PLUGIN_VERSION, PLUGIN_AUTHOR)
@@ -323,7 +323,8 @@ namespace noise_multiply
 
 namespace velvet
 {
-	FILTER_INFO("Velvet Noise");
+	// ref: https://en.wikipedia.org/wiki/Colors_of_noise#Velvet_noise
+	FILTER_INFO("ベルベットノイズ");
 
 	// trackbars.
 	constexpr char const* track_names[] = { "密度", "指数", "分解能", "背景音量" };
