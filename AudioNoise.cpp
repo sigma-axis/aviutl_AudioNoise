@@ -92,7 +92,7 @@ struct check_data {
 	};
 };
 
-#define PLUGIN_VERSION	"v1.10-test7"
+#define PLUGIN_VERSION	"v1.10-test8"
 #define PLUGIN_AUTHOR	"sigma-axis"
 #define FILTER_INFO_FMT(name, ver, author)	(name " " ver " by " author)
 #define FILTER_INFO(name)	constexpr char filter_name[] = name, info[] = FILTER_INFO_FMT(name, PLUGIN_VERSION, PLUGIN_AUTHOR)
@@ -619,8 +619,8 @@ protected:
 public:
 	static inline void* memory_ptr = nullptr;
 };
-struct powered_noise : colored_noise {
-	powered_noise(float alpha, uint32_t fft_size, uint32_t seed, uint_fast64_t pos, size_t alt = 0)
+struct gaussian_noise : colored_noise {
+	gaussian_noise(float alpha, uint32_t fft_size, uint32_t seed, uint_fast64_t pos, size_t alt = 0)
 		: alpha{ alpha }
 		, fft_size{ alpha == 0 ? 2 /* to let `get_index()` always return 0 */ : fft_size }
 		, buf{ alpha == 0 ? reinterpret_cast<float*>(memory_ptr) + alt :
@@ -750,7 +750,7 @@ struct velvet_noise : colored_noise {
 
 	float value() const {
 		if (alpha == 0)
-			return pos_period == pos_pulse ? neg_pulse ? -1.0f : 1.0f : 0.0f;
+			return pos_period == pos_pulse ? val_pulse : 0.0f;
 		else return buf[get_index(pos)];
 	}
 	void move_next() {
@@ -776,12 +776,12 @@ private:
 	uint32_t pos_period;
 	philox rng;
 	uint32_t pos_pulse;
-	bool neg_pulse;
+	float val_pulse;
 	float* const buf;
 
 	size_t get_index(uint_fast64_t p) const { return p & ((fft_size / 2) - 1); }
 
-	void set_next() { std::tie(pos_pulse, neg_pulse) = parse_rand(rng()); }
+	void set_next() { std::tie(pos_pulse, val_pulse) = parse_rand(rng()); }
 	void batch(uint_fast64_t pos_period_0)
 	{
 		// assumes alpha is nonzero.
@@ -799,19 +799,17 @@ private:
 		// set velvet noise to the time space.
 		auto const buf1 = fft_buf(), buf2 = buf1 + fft_size;
 		std::memset(buf1, 0, sizeof(FFT::cpx) * fft_size);
-		auto [pos_pulse_1, neg_pulse_1] = parse_rand(rng1());
+		auto [pos_pulse_1, val_pulse_1] = parse_rand(rng1());
 		for (size_t i = 0; i < fft_size; i++) {
-			if (pos_pulse_1 == pos_period_1) {
+			if (pos_pulse_1 == pos_period_1)
 				// - tilt by `-pi i n/N` so the frequency is shifted by 0.5.
 				// - taking the complex conjugate to adapt to inverse FFT.
-				auto& q = fft->q(i << red_bits);
-				buf1[i] = neg_pulse_1 ? -q : q;
-			}
+				buf1[i] = val_pulse_1 * fft->q(i << red_bits);
 
 			// determine the next position of the pulse.
 			if (++pos_period_1 == period) {
 				pos_period_1 = 0;
-				std::tie(pos_pulse_1, neg_pulse_1) = parse_rand(rng1());
+				std::tie(pos_pulse_1, val_pulse_1) = parse_rand(rng1());
 			}
 		}
 
@@ -850,11 +848,11 @@ private:
 		}
 	}
 
-	std::pair<uint32_t, bool> parse_rand(uint32_t r) const { return parse_rand(r, period); }
-	constexpr static std::pair<uint32_t, bool> parse_rand(uint32_t r, uint32_t period) {
+	std::pair<uint32_t, float> parse_rand(uint32_t r) const { return parse_rand(r, period); }
+	constexpr static std::pair<uint32_t, float> parse_rand(uint32_t r, uint32_t period) {
 		return {
 			static_cast<uint32_t>((period * static_cast<uint64_t>(r & ~(1u << 31))) >> 31),
-			(r & (1u << 31)) != 0
+			(r & (1u << 31)) != 0 ? -1.0f : 1.0f
 		};
 	}
 };
@@ -881,7 +879,7 @@ static inline uint32_t calc_seed(int32_t seed, ExEdit::Filter const* efp)
 		seed ^ static_cast<uint32_t>(efp->exfunc->get_start_idx(efp->processing));
 }
 
-struct pos_phase {
+struct gaussian_noise_state {
 	uint64_t pos;
 	double phase;
 
@@ -895,6 +893,31 @@ struct pos_phase {
 		pos--;
 	}
 };
+
+struct velvet_noise_state {
+	uint64_t pos;
+	double phase;
+	uint64_t count_period;
+	double phase_period;
+
+	constexpr bool is_default() const { return pos == 0 && phase == 0 && count_period == 0 && phase_period == 0; }
+	constexpr auto& normalize() {
+		phase = std::isfinite(phase) && 0 < phase && phase < 1 ? phase : 0;
+		phase_period = std::isfinite(phase_period) && 0 < phase_period && phase_period < 1 ? phase_period : 0;
+		return *this;
+	}
+	constexpr void rewind_one(uint32_t period) {
+		// rewind the state by one step to adapt read-forward behavior for interpolation.
+		pos--;
+		phase_period -= 1.0 / period;
+		if (phase_period < 0) {
+			auto i = std::floor(phase_period);
+			count_period += static_cast<int_fast64_t>(i);
+			phase_period -= i;
+		}
+	}
+};
+
 // adjusts the frequency according to the playback rate,
 // and possibly reset the state of noise.
 template<class noise_state>
@@ -954,12 +977,12 @@ static constexpr auto lambda_step_one(double& phase, double delta) {
 		phase += delta;
 		if (phase >= 1) {
 			phase -= std::floor(phase);
-			[&] <size_t... I>(std::index_sequence<I...>) {
-				((
-					(std::get<2 * I + 1>(std::forward_as_tuple(args...)) = std::get<2 * I>(std::forward_as_tuple(args...)).value()),
-					std::get<2 * I>(std::forward_as_tuple(args...)).move_next()
-					), ...);
-			}(std::make_index_sequence<sizeof...(args) / 2>{});
+			[&](this auto&& self, auto& gen, auto& prev, auto&... rest) {
+				prev = gen.value();
+				gen.move_next();
+
+				if constexpr (sizeof...(rest) > 0) self(rest...);
+			}(args...);
 		}
 	};
 }
@@ -976,6 +999,13 @@ static void set_noise_gen_space(ExEdit::FilterProcInfo* efpip)
 			+ 3) & (-4); // align as 4 bytes.
 	colored_noise::memory_ptr = reinterpret_cast<void*>(mem);
 }
+
+static void apply_volume(float volume, int16_t* st, int16_t const* ed)
+{
+	for (auto p = st; p < st; p++)
+		*p = static_cast<int16_t>(std::lround(volume * *p));
+}
+static void apply_volume(float volume, int16_t* st, int count) { apply_volume(volume, st, st + count); }
 
 BOOL noise::func_proc(ExEdit::Filter* efp, ExEdit::FilterProcInfo* efpip)
 {
@@ -1011,15 +1041,15 @@ BOOL noise::func_proc(ExEdit::Filter* efp, ExEdit::FilterProcInfo* efpip)
 		fft_size	= exdata->clamped_fft_size();
 
 	// recall previous state.
-	auto [delta_phase, state_ptr] = adjust_pos_phase<pos_phase>(hertz, efp, efpip);
+	auto [delta_phase, state_ptr] = adjust_pos_phase<gaussian_noise_state>(hertz, efp, efpip);
 	auto [pos, phase] = state_ptr != nullptr ? *state_ptr : std::decay_t<decltype(*state_ptr)>{};
 	constexpr double const_0 = 0;
 	double const& phase_ref = interpolate ? phase : const_0;
 
 	// generate noise.
-	double const delta_phase_corr = raw_freq >= max_freq ? 1.0 : delta_phase;
+	double const delta_phase_corr = raw_freq >= max_freq ? 1.0 : std::min(delta_phase, 1.0);
 	auto step_one = lambda_step_one(phase, delta_phase_corr);
-	auto val = [&phase_ref](powered_noise const& gen, float prev) {
+	auto val = [&phase_ref](gaussian_noise const& gen, float prev) {
 		auto const t = static_cast<float>(phase_ref);
 		return to_int((1 - t) * prev + t * gen.value());
 	};
@@ -1027,7 +1057,7 @@ BOOL noise::func_proc(ExEdit::Filter* efp, ExEdit::FilterProcInfo* efpip)
 	int16_t* const data = efpip->audio_data;
 	if (stereo && efpip->audio_ch == 2) {
 		// prepare two noise generators.
-		powered_noise
+		gaussian_noise
 			genL{ alpha, fft_size, seed, pos },
 			genR{ alpha, fft_size, ~seed, pos, 1 };
 		float prevL = genL.value(), prevR = genR.value();
@@ -1045,7 +1075,7 @@ BOOL noise::func_proc(ExEdit::Filter* efp, ExEdit::FilterProcInfo* efpip)
 	}
 	else {
 		// prepare a noise generator.
-		powered_noise gen{ alpha, fft_size, seed, pos };
+		gaussian_noise gen{ alpha, fft_size, seed, pos };
 		float prev = gen.value(); gen.move_next();
 
 		// write values to the buffer.
@@ -1066,17 +1096,15 @@ BOOL noise::func_proc(ExEdit::Filter* efp, ExEdit::FilterProcInfo* efpip)
 		pos = gen.pos;
 	}
 
-	// lower (or possibly gain) the sound already rendered.
-	if (back_volume != 1.0f) {
-		for (auto p = efpip->audio_p, e = p + efpip->audio_ch * efpip->audio_n; p < e; p++)
-			*p = static_cast<int16_t>(std::lround(back_volume * *p));
-	}
-
 	// store the phase and the position for the next use.
 	if (state_ptr != nullptr) {
 		*state_ptr = { pos, phase };
 		state_ptr->rewind_one();
 	}
+
+	// lower (or possibly gain) the sound already rendered.
+	if (back_volume != 1.0f)
+		apply_volume(back_volume, efpip->audio_p, efpip->audio_ch * efpip->audio_n);
 
 	return TRUE;
 }
@@ -1125,15 +1153,15 @@ BOOL noise_multiply::func_proc(ExEdit::Filter* efp, ExEdit::FilterProcInfo* efpi
 		fft_size	= exdata->clamped_fft_size();
 
 	// recall previous state.
-	auto [delta_phase, state_ptr] = adjust_pos_phase<pos_phase>(hertz, efp, efpip);
+	auto [delta_phase, state_ptr] = adjust_pos_phase<gaussian_noise_state>(hertz, efp, efpip);
 	auto [pos, phase] = state_ptr != nullptr ? *state_ptr : std::decay_t<decltype(*state_ptr)>{};
 	constexpr double const_0 = 0;
 	double const& phase_ref = interpolate ? phase : const_0;
 
 	// filter by noise.
-	double const delta_phase_corr = raw_freq >= max_freq ? 1.0 : delta_phase;
+	double const delta_phase_corr = raw_freq >= max_freq ? 1.0 : std::min(delta_phase, 1.0);
 	auto step_one = lambda_step_one(phase, delta_phase_corr);
-	auto val = [&phase_ref](powered_noise const& gen, float prev) {
+	auto val = [&phase_ref](gaussian_noise const& gen, float prev) {
 		auto const t = static_cast<float>(phase_ref);
 		return (1 - t) * prev + t * gen.value();
 	};
@@ -1152,7 +1180,7 @@ BOOL noise_multiply::func_proc(ExEdit::Filter* efp, ExEdit::FilterProcInfo* efpi
 		efpip->audio_data : efpip->audio_p;
 	if (stereo && efpip->audio_ch == 2) {
 		// prepare two noise generators.
-		powered_noise
+		gaussian_noise
 			genL{ alpha, fft_size, seed, pos },
 			genR{ alpha, fft_size, ~seed, pos, 1 };
 		float prevL = genL.value(), prevR = genR.value();
@@ -1170,7 +1198,7 @@ BOOL noise_multiply::func_proc(ExEdit::Filter* efp, ExEdit::FilterProcInfo* efpi
 	}
 	else {
 		// prepare a noise generator.
-		powered_noise gen{ alpha, fft_size, seed, pos };
+		gaussian_noise gen{ alpha, fft_size, seed, pos };
 		float prev = gen.value(); gen.move_next();
 
 		// write values to the buffer.
@@ -1199,30 +1227,6 @@ BOOL noise_multiply::func_proc(ExEdit::Filter* efp, ExEdit::FilterProcInfo* efpi
 
 	return TRUE;
 }
-
-struct pos_phase_velvet {
-	uint64_t pos;
-	double phase;
-	uint64_t count_period;
-	double phase_period;
-
-	constexpr bool is_default() const { return pos == 0 && phase == 0 && count_period == 0 && phase_period == 0; }
-	constexpr auto& normalize() {
-		phase = std::isfinite(phase) && 0 < phase && phase < 1 ? phase : 0;
-		phase_period = std::isfinite(phase_period) && 0 < phase_period && phase_period < 1 ? phase_period : 0;
-		return *this;
-	}
-	constexpr void rewind_one(uint32_t period) {
-		// rewind the state by one step to adapt read-forward behavior for interpolation.
-		pos--;
-		phase_period -= 1.0 / period;
-		if (phase_period < 0) {
-			auto i = std::floor(phase_period);
-			count_period += static_cast<int_fast64_t>(i);
-			phase_period -= i;
-		}
-	}
-};
 
 BOOL velvet::func_proc(ExEdit::Filter* efp, ExEdit::FilterProcInfo* efpip)
 {
@@ -1264,13 +1268,13 @@ BOOL velvet::func_proc(ExEdit::Filter* efp, ExEdit::FilterProcInfo* efpip)
 		fft_size	= exdata->clamped_fft_size();
 
 	// recall previous state.
-	auto [delta_phase, state_ptr] = adjust_pos_phase<pos_phase_velvet>(hertz, efp, efpip);
-	auto [pos, phase, count_period, phase_period] = state_ptr != nullptr ? *state_ptr : pos_phase_velvet{};
+	auto [delta_phase, state_ptr] = adjust_pos_phase<velvet_noise_state>(hertz, efp, efpip);
+	auto [pos, phase, count_period, phase_period] = state_ptr != nullptr ? *state_ptr : std::decay_t<decltype(*state_ptr)>{};
 	constexpr double const_0 = 0;
 	double const& phase_ref = interpolate ? phase : const_0;
 
 	// generate noise.
-	double const delta_phase_corr = raw_freq >= max_freq ? 1.0 : delta_phase;
+	double const delta_phase_corr = raw_freq >= max_freq ? 1.0 : std::min(delta_phase, 1.0);
 	uint32_t const period = raw_fuzzy >= max_fuzzy ? 1 :
 		std::max<uint32_t>(std::lround(delta_phase_corr * efpip->audio_rate / taps_hertz), 1);
 	auto step_one = lambda_step_one(phase, delta_phase_corr);
@@ -1325,17 +1329,15 @@ BOOL velvet::func_proc(ExEdit::Filter* efp, ExEdit::FilterProcInfo* efpip)
 		phase_period = gen.phase_period();
 	}
 
-	// lower (or possibly gain) the sound already rendered.
-	if (back_volume != 1.0f) {
-		for (auto p = efpip->audio_p, e = p + efpip->audio_ch * efpip->audio_n; p < e; p++)
-			*p = static_cast<int16_t>(std::lround(back_volume * *p));
-	}
-
 	// store the states for the next use.
 	if (state_ptr != nullptr) {
 		*state_ptr = { pos, phase, count_period, phase_period };
 		state_ptr->rewind_one(period);
 	}
+
+	// lower (or possibly gain) the sound already rendered.
+	if (back_volume != 1.0f)
+		apply_volume(back_volume, efpip->audio_p, efpip->audio_ch * efpip->audio_n);
 
 	return TRUE;
 }
@@ -1392,11 +1394,8 @@ BOOL pulse::func_proc(ExEdit::Filter* efp, ExEdit::FilterProcInfo* efpip)
 		std::memset(data + i_e, 0, (N - i_e) * sizeof(int16_t));
 
 		// lower (or possibly gain) the sound already rendered.
-		if (back_volume != 1.0f) {
-			int16_t* const back = efpip->audio_p;
-			for (int i = i_s; i < i_e; i++)
-				back[i] = static_cast<int16_t>(std::lround(back_volume * back[i]));
-		}
+		if (back_volume != 1.0f)
+			apply_volume(back_volume, efpip->audio_p + i_s, efpip->audio_p + i_e);
 	}
 
 	return TRUE;
