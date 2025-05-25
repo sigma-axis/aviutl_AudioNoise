@@ -92,7 +92,7 @@ struct check_data {
 	};
 };
 
-#define PLUGIN_VERSION	"v1.10-beta9"
+#define PLUGIN_VERSION	"v1.10-beta10"
 #define PLUGIN_AUTHOR	"sigma-axis"
 #define FILTER_INFO_FMT(name, ver, author)	(name " " ver " by " author)
 #define FILTER_INFO(name)	constexpr char filter_name[] = name, info[] = FILTER_INFO_FMT(name, PLUGIN_VERSION, PLUGIN_AUTHOR)
@@ -332,7 +332,7 @@ namespace velvet
 		track_denom[]	= {   100,    100,   100,   10 },
 		track_min[]		= { -4800, -40000, -4800,    0 },
 		track_min_drag[]= {     0, -20000,     0,    0 },
-		track_default[]	= { +3300,      0, +9600, 1000 },
+		track_default[]	= { +3000,      0, +9600, 1000 },
 		track_max_drag[]= { +7200, +20000, +7200, 1000 },
 		track_max[]		= { +9600, +40000, +9600, 2000 };
 
@@ -706,16 +706,17 @@ private:
 };
 
 struct velvet_noise : colored_noise {
-	velvet_noise(uint32_t period, float alpha, uint32_t fft_size, uint32_t seed,
+	velvet_noise(double period, float alpha, uint32_t fft_size, uint32_t seed,
 		uint_fast64_t pos, uint_fast64_t count_period, double phase_period, size_t alt = 0)
-		: period{ period }, fft_size{ fft_size }, alpha{ alpha }
-		, pos{ pos }, count_period{ count_period }
-		, pos_period{ static_cast<uint32_t>(std::clamp<int>(std::lround(phase_period * period), 0, period - 1)) }
-		, rng{ seed ^ philox::default_seed }
+		: period_16{ static_cast<uint32_t>(std::lround(denom_period * period)) }, fft_size{ fft_size }, alpha{ alpha }
+		, pos{ pos }, rng{ seed ^ philox::default_seed }
 		, buf{ alpha == 0 ? nullptr :
 			(wt_tbl(fft_size) + (fft_size / 2)) + fft_size * alt }
 		, red_bits{ std::bit_width(max_fft_size) - std::bit_width(fft_size) }
 	{
+		this->count_period = count_period +
+			floor_div(std::lround(denom_period * phase_period * period), period_16, pos_period_16);
+
 		if (alpha == 0) {
 			rng.discard(max_fft_size + count_period);
 			set_next();
@@ -729,52 +730,52 @@ struct velvet_noise : colored_noise {
 				1 / std::sqrtf(static_cast<float>(2 * fft_size)));
 
 			// prepare output buffer. adjust positions.
-			uint_fast64_t rng_pos = max_fft_size + count_period;
-			uint32_t pos_period_0 = pos_period;
-			auto const pos_residue = pos & (fft_size / 2 - 1);
-			if (pos_residue + fft_size / 2 > pos_period) {
-				auto const l = pos_residue + fft_size / 2 - pos_period + period - 1;
-				rng_pos -= l / period;
-				pos_period_0 = (period - 1) - (l % period);
-			}
+			int32_t pos_period_0;
+			auto const rng_pos = max_fft_size + count_period + static_cast<uint_fast64_t>(
+				floor_div(static_cast<int32_t>(
+					pos_period_16 - (((static_cast<uint32_t>(pos) & (fft_size / 2 - 1)) + (fft_size / 2)) << denom_period_bits)),
+					period_16, pos_period_0));
 
 			// expand values to buf; needs two passes.
 			rng.discard(rng_pos);
 			batch(pos_period_0);
-			batch((pos_period_0 + fft_size / 2) % period);
+			batch((pos_period_0 + ((fft_size / 2) << denom_period_bits)) % period_16);
 		}
 	}
 
-	uint32_t const period, fft_size;
 	float const alpha;
+	uint32_t const fft_size;
 	uint_fast64_t pos, count_period;
 
 	float value() const {
 		if (alpha == 0)
-			return pos_period == pos_pulse ? val_pulse : 0.0f;
+			return (pos_period_16 >> denom_period_bits) == pos_pulse ? val_pulse : 0.0f;
 		else return buf[get_index(pos)];
 	}
 	void move_next() {
-		pos++; pos_period++;
-		if (pos_period == period) {
-			pos_period = 0;
+		pos++; pos_period_16 += denom_period;
+		if (pos_period_16 >= period_16) {
+			pos_period_16 %= period_16;
 			count_period++;
 		}
 
 		if (alpha == 0) {
-			if (pos_period == 0) set_next();
+			if (pos_period_16 < denom_period) set_next();
 		}
 		else {
-			if (get_index(pos) == 0) batch(pos_period);
+			if (get_index(pos) == 0) batch(pos_period_16);
 		}
 	}
-	double phase_period() const { return pos_period / static_cast<double>(period); }
+	double period() const { return period_16 / static_cast<double>(denom_period); }
+	double phase_period() const { return pos_period_16 / static_cast<double>(period_16); }
 
 private:
+	constexpr static int32_t denom_period_bits = 16, denom_period = 1 << denom_period_bits;
+
 	int const red_bits; // number of bits reduced from the maximum.
 
 	using philox = sigma_lib::rng::philox_test::philox4x32;
-	uint32_t pos_period;
+	uint32_t const period_16; uint32_t pos_period_16; // denominator 2^16.
 	philox rng;
 	uint32_t pos_pulse;
 	float val_pulse;
@@ -782,35 +783,29 @@ private:
 
 	size_t get_index(uint_fast64_t p) const { return p & ((fft_size / 2) - 1); }
 
-	void set_next() { std::tie(pos_pulse, val_pulse) = parse_rand(rng()); }
-	void batch(uint_fast64_t pos_period_0)
+	void set_next() { std::tie(pos_pulse, val_pulse) = parse_rand(rng(), period_16, pos_period_16); }
+	void batch(uint32_t pos_period_0)
 	{
 		// assumes alpha is nonzero.
 		auto rng1 = rng;
 
-		// estimate the previous batch state.
-		uint32_t pos_period_1;
-		if (pos_period_0 >= fft_size / 2) pos_period_1 = (pos_period_0 - fft_size / 2) % period;
-		else {
-			auto const l = fft_size / 2 - pos_period_0 + period - 1;
-			rng.discard(l / period);
-			pos_period_1 = (period - 1) - (l % period);
-		}
+		// estimate the next batch state.
+		rng.discard(floor_div(pos_period_0 + ((fft_size / 2) << denom_period_bits), period_16));
 
 		// set velvet noise to the time space.
 		auto const buf1 = fft_buf(), buf2 = buf1 + fft_size;
 		std::memset(buf1, 0, sizeof(FFT::cpx) * fft_size);
-		auto [pos_pulse_1, val_pulse_1] = parse_rand(rng1());
+		auto [pos_pulse_1, val_pulse_1] = parse_rand(rng1(), period_16, pos_period_0);
 		for (size_t i = 0; i < fft_size; i++) {
-			if (pos_pulse_1 == pos_period_1)
+			if ((pos_period_0 >> denom_period_bits) == pos_pulse_1)
 				// - tilt by `-pi i n/N` so the frequency is shifted by 0.5.
 				// - taking the complex conjugate to adapt to inverse FFT.
 				buf1[i] = val_pulse_1 * fft->q(i << red_bits);
 
 			// determine the next position of the pulse.
-			if (++pos_period_1 == period) {
-				pos_period_1 = 0;
-				std::tie(pos_pulse_1, val_pulse_1) = parse_rand(rng1());
+			if ((pos_period_0 += denom_period) >= period_16) {
+				pos_period_0 %= period_16;
+				std::tie(pos_pulse_1, val_pulse_1) = parse_rand(rng1(), period_16, pos_period_0);
 			}
 		}
 
@@ -849,12 +844,26 @@ private:
 		}
 	}
 
-	std::pair<uint32_t, float> parse_rand(uint32_t r) const { return parse_rand(r, period); }
-	constexpr static std::pair<uint32_t, float> parse_rand(uint32_t r, uint32_t period) {
+	constexpr static std::pair<uint32_t, float> parse_rand(uint32_t r, uint32_t period_16, uint32_t pos_period_16) {
+		auto const period = (period_16 - (pos_period_16 & (denom_period - 1))
+			+ (denom_period - 1)) >> denom_period_bits;
 		return {
 			static_cast<uint32_t>((period * static_cast<uint64_t>(r & ~(1u << 31))) >> 31),
 			(r & (1u << 31)) != 0 ? -1.0f : 1.0f
 		};
+	}
+
+	// assumes b > 0.
+	template<std::integral IntT>
+	/*constexpr <- causes internal error */ static IntT floor_div(IntT a, std::integral auto b, std::integral auto&... rems)
+	{
+		IntT q;
+		if constexpr (std::signed_integral<IntT>)
+			q = (a < 0 ? static_cast<IntT>(a - b + 1) : a) / static_cast<IntT>(b);
+		else q = a / static_cast<IntT>(b);
+		if constexpr (sizeof...(rems) > 0)
+			((rems = static_cast<std::remove_reference_t<decltype(rems)>>(a - q * b)), ...);
+		return q;
 	}
 };
 
@@ -907,7 +916,7 @@ struct velvet_noise_state {
 		phase_period = std::isfinite(phase_period) && 0 < phase_period && phase_period < 1 ? phase_period : 0;
 		return *this;
 	}
-	constexpr void rewind_one(uint32_t period) {
+	constexpr void rewind_one(double period) {
 		// rewind the state by one step to adapt read-forward behavior for interpolation.
 		pos--;
 		phase_period -= 1.0 / period;
@@ -1275,9 +1284,10 @@ BOOL velvet::func_proc(ExEdit::Filter* efp, ExEdit::FilterProcInfo* efpip)
 	double const& phase_ref = interpolate ? phase : const_0;
 
 	// generate noise.
-	double const delta_phase_corr = raw_freq >= max_freq ? 1.0 : std::min(delta_phase, 1.0);
-	uint32_t const period = raw_fuzzy >= max_fuzzy ? 1 :
-		std::max<uint32_t>(std::lround(delta_phase_corr * efpip->audio_rate / taps_hertz), 1);
+	double const
+		delta_phase_corr = raw_freq >= max_freq ? 1.0 : std::min(delta_phase, 1.0),
+		period = raw_fuzzy >= max_fuzzy ? 1 :
+			std::max(delta_phase_corr * efpip->audio_rate / taps_hertz, 1.0);
 	auto step_one = lambda_step_one(phase, delta_phase_corr);
 	auto val = [&phase_ref](velvet_noise const& gen, float prev) {
 		auto const t = static_cast<float>(phase_ref);
