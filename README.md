@@ -187,13 +187,13 @@ https://github.com/user-attachments/assets/b59be335-5928-4829-94a3-7cbc44afb263
 
 ### ベルベットノイズ
 
-[Velvet noise](https://en.wikipedia.org/wiki/Colors_of_noise#Velvet_noise) を生成し，音として再生します．音声サンプルのほとんどが `0` で，離散的にパルスが並んだ波形のノイズです．正規分布に基づく[音声ノイズ](#音声ノイズ)に比べて，"スムーズ" な質感に聞こえます．
+[Velvet noise](https://en.wikipedia.org/wiki/Colors_of_noise#Velvet_noise) を生成し，音として再生します．音声サンプルのほとんどが 0 で，離散的にパルスが並んだ波形のノイズです．正規分布に基づく[音声ノイズ](#音声ノイズ)に比べて，"スムーズ" な質感に聞こえます．
 
-TODO: image of graph.
+![Velvet Noise のグラフ](https://github.com/user-attachments/assets/fd5cd970-fa84-44f3-aae6-f8e3b4989979)
 
-TODO: demo video with sound.
+https://github.com/user-attachments/assets/f8f0948f-de9c-4d60-8a54-cf15244e0bcd
 
-TODO: image of GUI.
+![ベルベットノイズの GUI](https://github.com/user-attachments/assets/aa99ff71-53f6-4e0b-b319-6739b9ca91e5)
 
 音声の入力フィルタとしてタイムラインに配置します．
 
