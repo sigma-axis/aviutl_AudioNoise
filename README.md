@@ -250,7 +250,7 @@ https://github.com/user-attachments/assets/f8f0948f-de9c-4d60-8a54-cf15244e0bcd
 
 ##  改版履歴
 
-- **v1.10** (2025-05-??)
+- **v1.10** (2025-05-31)
 
   - 「ベルベットノイズ」を追加．
 
